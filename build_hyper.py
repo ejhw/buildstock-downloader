@@ -37,6 +37,7 @@ import shutil
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pandas as pd
@@ -242,30 +243,25 @@ def write_chunk_hyper(df: pd.DataFrame, hyper_path: Path, create_mode: CreateMod
                 connection.catalog.create_schema_if_not_exists("Extract")
                 connection.catalog.create_table(table_def)
 
-            # Convert DataFrame rows to tuples (replacing NaN → None)
+            # Convert DataFrame, replacing NaN → None for Hyper compatibility
             df_clean = df.where(pd.notnull(df), None)
 
             # Write in batches so we can report progress
             rows_written = 0
             with Inserter(connection, table_def) as inserter:
-                batch: list[tuple] = []
-                for row in df_clean.itertuples(index=False, name=None):
-                    batch.append(row)
-                    if len(batch) >= _WRITE_BATCH_SIZE:
-                        inserter.add_rows(batch)
-                        rows_written += len(batch)
-                        batch = []
-                        elapsed = time.monotonic() - t0
-                        pct = 100 * rows_written / total_rows
-                        rate = rows_written / elapsed if elapsed > 0 else 0
-                        _progress_line(
-                            f"  Writing {hyper_path.name}: "
-                            f"{rows_written:,}/{total_rows:,} rows "
-                            f"({pct:.0f}%) @ {rate:,.0f} rows/s"
-                        )
-                if batch:
+                for start in range(0, total_rows, _WRITE_BATCH_SIZE):
+                    end = min(start + _WRITE_BATCH_SIZE, total_rows)
+                    batch = df_clean.iloc[start:end].values.tolist()
                     inserter.add_rows(batch)
                     rows_written += len(batch)
+                    elapsed = time.monotonic() - t0
+                    pct = 100 * rows_written / total_rows
+                    rate = rows_written / elapsed if elapsed > 0 else 0
+                    _progress_line(
+                        f"  Writing {hyper_path.name}: "
+                        f"{rows_written:,}/{total_rows:,} rows "
+                        f"({pct:.0f}%) @ {rate:,.0f} rows/s"
+                    )
                 inserter.execute()
 
     elapsed = time.monotonic() - t0
@@ -375,6 +371,24 @@ def parse_args() -> argparse.Namespace:
 
 
 # ---------------------------------------------------------------------------
+# Pipeline helper
+# ---------------------------------------------------------------------------
+
+def _read_chunk(
+    chunk_files: list[Path], input_dir: Path, progress: Progress
+) -> pd.DataFrame:
+    """Read and process a chunk of CSV files.  Intended for a background thread."""
+    frames: list[pd.DataFrame] = []
+    for csv_path in chunk_files:
+        df_part = process_csv(csv_path)
+        progress.update(csv_path, input_dir, len(df_part))
+        frames.append(df_part)
+    df = pd.concat(frames, ignore_index=True)
+    del frames
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -422,26 +436,34 @@ def main() -> int:
     chunk_paths: list[Path] = []
 
     try:
-        for chunk_idx, chunk_files in enumerate(chunks, 1):
-            frames: list[pd.DataFrame] = []
-            for csv_path in chunk_files:
-                df_part = process_csv(csv_path)
-                progress.update(csv_path, input_dir, len(df_part))
-                frames.append(df_part)
+        # Pipeline: read next chunk in a background thread while writing
+        # the current chunk to Hyper.
+        with ThreadPoolExecutor(max_workers=1) as reader_pool:
+            # Kick off reading the first chunk
+            pending = reader_pool.submit(
+                _read_chunk, chunks[0], input_dir, progress
+            )
 
-            df = pd.concat(frames, ignore_index=True)
-            del frames  # free memory
+            for chunk_idx in range(len(chunks)):
+                # Wait for the current chunk to finish reading
+                df = pending.result()
 
-            if not printed_columns:
-                progress.finish()
-                print(f"  Columns: {list(df.columns)}")
-                printed_columns = True
+                # Submit the *next* chunk for reading while we write this one
+                if chunk_idx + 1 < len(chunks):
+                    pending = reader_pool.submit(
+                        _read_chunk, chunks[chunk_idx + 1], input_dir, progress
+                    )
 
-            # Write this chunk to its own temp .hyper file
-            chunk_hyper = tmp_dir / f"chunk_{chunk_idx:04d}.hyper"
-            write_chunk_hyper(df, chunk_hyper, CreateMode.CREATE_AND_REPLACE)
-            chunk_paths.append(chunk_hyper)
-            del df
+                if not printed_columns:
+                    progress.finish()
+                    print(f"  Columns: {list(df.columns)}")
+                    printed_columns = True
+
+                # Write this chunk to its own temp .hyper file
+                chunk_hyper = tmp_dir / f"chunk_{chunk_idx + 1:04d}.hyper"
+                write_chunk_hyper(df, chunk_hyper, CreateMode.CREATE_AND_REPLACE)
+                chunk_paths.append(chunk_hyper)
+                del df
 
         # ----- merge -----
         t_merge = time.monotonic()
