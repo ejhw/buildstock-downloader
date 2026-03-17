@@ -33,8 +33,12 @@ Usage examples:
     # Use 16 parallel workers and save to a custom directory
     python download_buildstock.py --workers 16 --output-dir /data/buildstock
 
-    # Download a different release year / release number
-    python download_buildstock.py --release-year 2024 --release-number 2
+    # Download a different release (ComStock or ResStock)
+    python download_buildstock.py --release-name comstock_amy2018_release_3
+    python download_buildstock.py --release-name resstock_amy2018_release_1
+
+    # My saved usage
+    python download_buildstock.py --upgrades 0 --dry-run --release-year 2025 --release-name comstock_amy2018_release_2
 """
 
 import argparse
@@ -55,14 +59,14 @@ BUCKET = "oedi-data-lake"
 BASE_URL = f"https://{BUCKET}.s3.amazonaws.com"
 
 DEFAULT_RELEASE_YEAR = 2025
-DEFAULT_RELEASE_NUMBER = 3
+DEFAULT_RELEASE_NAME = "comstock_amy2018_release_3"
 
 
-def build_prefix(release_year: int, release_number: int) -> str:
-    """Return the S3 key prefix for the given release year and number."""
+def build_prefix(release_year: int, release_name: str) -> str:
+    """Return the S3 key prefix for the given release year and release name."""
     return (
         f"nrel-pds-building-stock/end-use-load-profiles-for-us-building-stock/"
-        f"{release_year}/comstock_amy2018_release_{release_number}/"
+        f"{release_year}/{release_name}/"
         f"timeseries_aggregates/by_state/"
     )
 
@@ -288,11 +292,12 @@ def parse_args() -> argparse.Namespace:
         help=f"Dataset release year (default: {DEFAULT_RELEASE_YEAR})",
     )
     parser.add_argument(
-        "--release-number",
-        type=int,
-        default=DEFAULT_RELEASE_NUMBER,
-        metavar="N",
-        help=f"Dataset release number (default: {DEFAULT_RELEASE_NUMBER})",
+        "--release-name",
+        type=str,
+        default=DEFAULT_RELEASE_NAME,
+        metavar="NAME",
+        help=f"Full release name, e.g. 'comstock_amy2018_release_3' or "
+             f"'resstock_amy2018_release_1' (default: {DEFAULT_RELEASE_NAME})",
     )
     return parser.parse_args()
 
@@ -307,7 +312,7 @@ def main() -> int:
     output_dir = Path(args.output_dir).expanduser().resolve()
     upgrades_filter = {str(u) for u in args.upgrades} if args.upgrades else None
     states_filter = {s.upper() for s in args.states} if args.states else None
-    prefix = build_prefix(args.release_year, args.release_number)
+    prefix = build_prefix(args.release_year, args.release_name)
 
     # ------------------------------------------------------------------ #
     # Step 1 – discover files                                             #
