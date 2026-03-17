@@ -5,21 +5,27 @@ Combine downloaded ComStock CSV files into a single Tableau .hyper file.
 For each CSV the script:
   1. Reads all rows, keeping non-"out." columns plus "out.electricity.*" columns.
   2. Melts (unpivots) the "out.electricity.*" columns into two new columns:
-       • end_use  – the human-readable end-use name (e.g. "cooling", "fans")
-       • kWh      – the value
+       • end_use  - the human-readable end-use name (e.g. "cooling", "fans")
+       • kWh      - the value
   3. Drops every other "out.*" column (district_cooling, natural_gas, etc.).
 
 The resulting long-format dataframe is written to a Tableau Hyper file.
 
 Usage examples:
-    # Process all CSVs under the default ./downloads directory
-    python build_hyper.py
+    # Process CSVs for a specific ComStock release
+    python build_hyper.py --input-dir ./downloads/2025/comstock_amy2018_release_3
 
-    # Point to a custom downloads folder and output file
-    python build_hyper.py --input-dir ./test_downloads --output comstock.hyper
+    # Process CSVs for a specific ResStock release
+    python build_hyper.py --input-dir ./downloads/2025/resstock_amy2018_release_1
+
+    # Custom output file name
+    python build_hyper.py --input-dir ./downloads/2025/comstock_amy2018_release_3 --output comstock.hyper
 
     # Only process files matching a glob (e.g. one state)
-    python build_hyper.py --glob "upgrade=0/state=CA/*.csv"
+    python build_hyper.py --input-dir ./downloads/2025/comstock_amy2018_release_3 --glob "upgrade=0/state=CA/*.csv"
+
+    # Use chunked processing to limit memory usage
+    python build_hyper.py --input-dir ./downloads/2025/comstock_amy2018_release_3 --chunk-size 50
 """
 
 import argparse
