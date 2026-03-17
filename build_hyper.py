@@ -205,14 +205,31 @@ def _build_table_definition(df: pd.DataFrame, table_name: str = "Extract") -> Ta
     return TableDefinition(TableName("Extract", table_name), columns)
 
 
+# Number of rows per batch when writing to Hyper (for progress reporting)
+_WRITE_BATCH_SIZE = 500_000
+
+
+def _progress_line(msg: str) -> None:
+    """Write a single-line progress message, truncated to terminal width."""
+    try:
+        cols = os.get_terminal_size().columns
+    except OSError:
+        cols = 80
+    sys.stdout.write(f"\r\033[K{msg[:cols - 1]}")
+    sys.stdout.flush()
+
+
 def write_chunk_hyper(df: pd.DataFrame, hyper_path: Path, create_mode: CreateMode) -> None:
     """
     Write *df* to a Tableau .hyper file at *hyper_path*.
 
     Uses CREATE_AND_REPLACE for new files or CREATE_IF_NOT_EXISTS for appends.
     A single HyperProcess is started per call to keep chunk writes independent.
+    Prints a progress line while writing rows.
     """
     hyper_path.parent.mkdir(parents=True, exist_ok=True)
+    total_rows = len(df)
+    t0 = time.monotonic()
 
     with HyperProcess(telemetry=Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
         with Connection(
@@ -228,9 +245,35 @@ def write_chunk_hyper(df: pd.DataFrame, hyper_path: Path, create_mode: CreateMod
             # Convert DataFrame rows to tuples (replacing NaN → None)
             df_clean = df.where(pd.notnull(df), None)
 
+            # Write in batches so we can report progress
+            rows_written = 0
             with Inserter(connection, table_def) as inserter:
-                inserter.add_rows(df_clean.itertuples(index=False, name=None))
+                batch: list[tuple] = []
+                for row in df_clean.itertuples(index=False, name=None):
+                    batch.append(row)
+                    if len(batch) >= _WRITE_BATCH_SIZE:
+                        inserter.add_rows(batch)
+                        rows_written += len(batch)
+                        batch = []
+                        elapsed = time.monotonic() - t0
+                        pct = 100 * rows_written / total_rows
+                        rate = rows_written / elapsed if elapsed > 0 else 0
+                        _progress_line(
+                            f"  Writing {hyper_path.name}: "
+                            f"{rows_written:,}/{total_rows:,} rows "
+                            f"({pct:.0f}%) @ {rate:,.0f} rows/s"
+                        )
+                if batch:
+                    inserter.add_rows(batch)
+                    rows_written += len(batch)
                 inserter.execute()
+
+    elapsed = time.monotonic() - t0
+    _progress_line(
+        f"  Writing {hyper_path.name}: "
+        f"{rows_written:,}/{total_rows:,} rows (100%) in {_fmt_time(elapsed)}"
+    )
+    print()  # newline after progress
 
 
 def merge_hyper_files(chunk_paths: list[Path], output_path: Path) -> int:
@@ -243,14 +286,17 @@ def merge_hyper_files(chunk_paths: list[Path], output_path: Path) -> int:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Use the first chunk as the base for the output file
+    _progress_line(f"  Copying base chunk to {output_path.name} …")
     shutil.copy2(chunk_paths[0], output_path)
 
     if len(chunk_paths) == 1:
+        _progress_line(f"  Counting rows in {output_path.name} …")
         with HyperProcess(telemetry=Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
             with Connection(hyper.endpoint, str(output_path), CreateMode.NONE) as conn:
                 row_count = conn.execute_scalar_query(
                     'SELECT COUNT(*) FROM "Extract"."Extract"'
                 )
+        print()  # newline after progress
         return int(row_count)
 
     table = TableName("Extract", "Extract")
@@ -267,6 +313,7 @@ def merge_hyper_files(chunk_paths: list[Path], output_path: Path) -> int:
             database=str(output_path),
             create_mode=CreateMode.NONE,
         ) as connection:
+            t0 = time.monotonic()
             for i, chunk_path in enumerate(chunk_paths[1:], 2):
                 db_alias = f"chunk_{i}"
                 connection.catalog.attach_database(str(chunk_path), db_alias)
@@ -275,11 +322,13 @@ def merge_hyper_files(chunk_paths: list[Path], output_path: Path) -> int:
                     f'SELECT * FROM "{db_alias}"."Extract"."Extract"'
                 )
                 connection.catalog.detach_database(db_alias)
-                sys.stdout.write(
-                    f"\r  Merged chunk {i}/{len(chunk_paths)} into {output_path.name}"
+                elapsed = time.monotonic() - t0
+                _progress_line(
+                    f"  Merging: chunk {i}/{len(chunk_paths)} "
+                    f"into {output_path.name}  {_fmt_time(elapsed)}"
                 )
-                sys.stdout.flush()
 
+            _progress_line(f"  Counting rows in {output_path.name} …")
             row_count = connection.execute_scalar_query(
                 f"SELECT COUNT(*) FROM {table}"
             )
@@ -392,8 +441,6 @@ def main() -> int:
             chunk_hyper = tmp_dir / f"chunk_{chunk_idx:04d}.hyper"
             write_chunk_hyper(df, chunk_hyper, CreateMode.CREATE_AND_REPLACE)
             chunk_paths.append(chunk_hyper)
-            print(f"  Wrote chunk {chunk_idx}/{len(chunks)} → {chunk_hyper.name}  "
-                  f"({len(df):,} rows)")
             del df
 
         # ----- merge -----
