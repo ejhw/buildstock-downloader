@@ -247,8 +247,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir",
-        default="downloads",
-        help="Local directory to save files into (default: ./downloads)",
+        default=None,
+        help="Local directory to save files into "
+             "(default: ./downloads/<release_year>/<release_name>)",
     )
     parser.add_argument(
         "--upgrades",
@@ -309,7 +310,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir = Path(
+        args.output_dir
+        if args.output_dir
+        else os.path.join("downloads", str(args.release_year), args.release_name)
+    ).expanduser().resolve()
     upgrades_filter = {str(u) for u in args.upgrades} if args.upgrades else None
     states_filter = {s.upper() for s in args.states} if args.states else None
     prefix = build_prefix(args.release_year, args.release_name)
