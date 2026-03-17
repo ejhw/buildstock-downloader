@@ -26,6 +26,7 @@ Usage examples:
 
     # Use chunked processing to limit memory usage
     python build_hyper.py --input-dir ./downloads/2025/comstock_amy2018_release_3 --chunk-size 50
+    python build_hyper.py --input-dir ./downloads/2025/resstock_amy2018_release_1 --chunk-size 50
 """
 
 import argparse
@@ -307,8 +308,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output",
-        default="comstock_timeseries.hyper",
-        help="Output .hyper file path (default: comstock_timeseries.hyper)",
+        default=None,
+        help="Output .hyper file path "
+             "(default: <input-dir folder name>.hyper, e.g. comstock_amy2018_release_3.hyper)",
     )
     parser.add_argument(
         "--chunk-size",
@@ -330,7 +332,8 @@ def main() -> int:
     args = parse_args()
 
     input_dir = Path(args.input_dir).expanduser().resolve()
-    output_path = Path(args.output).expanduser().resolve()
+    output_name = args.output if args.output else f"{input_dir.name}.hyper"
+    output_path = Path(output_name).expanduser().resolve()
 
     if not input_dir.is_dir():
         print(f"Error: input directory does not exist: {input_dir}", file=sys.stderr)
