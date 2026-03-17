@@ -39,6 +39,7 @@ Usage examples:
 
     # My saved usage
     python download_buildstock.py --upgrades 0 --dry-run --release-year 2025 --release-name comstock_amy2018_release_2
+    python download_buildstock.py --upgrades 0 --dry-run --release-year 2025 --release-name resstock_amy2018_release_1
 """
 
 import argparse
@@ -202,14 +203,21 @@ class Progress:
         rate = self.bytes_done / elapsed if elapsed > 0 else 0
         pct = 100 * self.done / self.total if self.total else 0
         line = (
-            f"\r  {self.done:>6}/{self.total}  "
+            f"  {self.done:>6}/{self.total}  "
             f"({pct:5.1f}%)  "
             f"{_fmt_bytes(self.bytes_done)}/{_fmt_bytes(self.total_bytes)}  "
             f"@ {_fmt_bytes(rate)}/s  "
-            f"errors={self.errors}  skipped={self.skipped}  "
-            f"elapsed={_fmt_time(elapsed)}"
+            f"err={self.errors} skip={self.skipped}  "
+            f"{_fmt_time(elapsed)}"
         )
-        sys.stdout.write(line)
+        # Truncate to terminal width so the line never wraps
+        try:
+            cols = os.get_terminal_size().columns
+        except OSError:
+            cols = 80
+        line = line[:cols - 1]
+        # \r returns to column 0; \033[K erases to end of line
+        sys.stdout.write(f"\r\033[K{line}")
         sys.stdout.flush()
 
     def finish(self) -> None:

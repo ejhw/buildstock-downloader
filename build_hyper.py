@@ -103,15 +103,21 @@ class Progress:
         rate = self.files_done / elapsed if elapsed > 0 else 0
         rel = file_path.relative_to(input_dir)
         line = (
-            f"\r  {self.files_done:>6}/{self.total_files}  "
+            f"  {self.files_done:>6}/{self.total_files}  "
             f"({pct:5.1f}%)  "
             f"rows={self.total_rows:>12,}  "
             f"@ {rate:5.1f} files/s  "
-            f"elapsed={_fmt_time(elapsed)}  "
+            f"{_fmt_time(elapsed)}  "
             f"{rel}"
         )
-        # Pad with spaces to overwrite any previous longer line
-        sys.stdout.write(f"{line:<120}")
+        # Truncate to terminal width so the line never wraps
+        try:
+            cols = os.get_terminal_size().columns
+        except OSError:
+            cols = 80
+        line = line[:cols - 1]
+        # \r returns to column 0; \033[K erases to end of line
+        sys.stdout.write(f"\r\033[K{line}")
         sys.stdout.flush()
 
     def finish(self) -> None:
