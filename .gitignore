@@ -1,0 +1,14 @@
+# Ignore downloaded data and generated files
+downloads/
+test_downloads/
+*.hyper
+*.twb
+*.twbr
+.~*
+hyperd.log
+.DS_Store
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
