@@ -22,7 +22,8 @@ Usage examples:
     python build_hyper.py --input-dir ./downloads/2025/comstock_amy2018_release_3 --output comstock.hyper
 
     # Only process files matching a glob (e.g. one state)
-    python build_hyper.py --input-dir ./downloads/2025/comstock_amy2018_release_3 --glob "upgrade=0/state=CA/*.csv"
+    python build_hyper.py --input-dir ./downloads/2025/comstock_amy2018_release_3 --glob "upgrade=0/state=AL/*.csv"
+    python build_hyper.py --input-dir ./downloads/2025/resstock_amy2018_release_1 --glob "upgrade=0/state=AL/*.csv"
 
     # Use chunked processing to limit memory usage
     python build_hyper.py --input-dir ./downloads/2025/comstock_amy2018_release_3 --chunk-size 50
@@ -332,7 +333,20 @@ def main() -> int:
     args = parse_args()
 
     input_dir = Path(args.input_dir).expanduser().resolve()
-    output_name = args.output if args.output else f"{input_dir.name}.hyper"
+
+    # Build default output filename, incorporating the glob filter if specified
+    if args.output:
+        output_name = args.output
+    else:
+        base = input_dir.name
+        if args.glob != "**/*.csv":
+            # Turn e.g. "upgrade=0/state=AL/*.csv" → "upgrade=0_state=AL"
+            glob_tag = args.glob.replace("/*.csv", "").replace("**/*.csv", "")
+            glob_tag = glob_tag.replace("**", "").replace("/", "_").strip("_")
+            if glob_tag:
+                base = f"{base}_{glob_tag}"
+        output_name = f"{base}.hyper"
+
     output_path = Path(output_name).expanduser().resolve()
 
     if not input_dir.is_dir():
