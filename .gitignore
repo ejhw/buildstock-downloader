@@ -11,3 +11,6 @@ hyperd.log
 # Python
 __pycache__/
 *.pyc
+resstock_export_dst_test.csv
+annual/comstock_amy2018_release_2 annual/upgrade0_agg_basic.parquet
+annual/resstock_amy2018_release_1 annual/upgrade0.parquet
