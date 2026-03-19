@@ -62,9 +62,38 @@ BASE_URL = f"https://{BUCKET}.s3.amazonaws.com"
 DEFAULT_RELEASE_YEAR = 2025
 DEFAULT_RELEASE_NAME = "comstock_amy2018_release_3"
 
+# FIPS state code -> two-letter abbreviation (for gap model county-to-state mapping)
+FIPS_TO_STATE = {
+    "01": "AL", "02": "AK", "04": "AZ", "05": "AR", "06": "CA",
+    "08": "CO", "09": "CT", "10": "DE", "11": "DC", "12": "FL",
+    "13": "GA", "15": "HI", "16": "ID", "17": "IL", "18": "IN",
+    "19": "IA", "20": "KS", "21": "KY", "22": "LA", "23": "ME",
+    "24": "MD", "25": "MA", "26": "MI", "27": "MN", "28": "MS",
+    "29": "MO", "30": "MT", "31": "NE", "32": "NV", "33": "NH",
+    "34": "NJ", "35": "NM", "36": "NY", "37": "NC", "38": "ND",
+    "39": "OH", "40": "OK", "41": "OR", "42": "PA", "44": "RI",
+    "45": "SC", "46": "SD", "47": "TN", "48": "TX", "49": "UT",
+    "50": "VT", "51": "VA", "53": "WA", "54": "WV", "55": "WI",
+    "56": "WY", "72": "PR", "78": "VI",
+}
+STATE_TO_FIPS = {v: k for k, v in FIPS_TO_STATE.items()}
 
-def build_prefix(release_year: int, release_name: str) -> str:
+
+def county_to_state_abbr(county_code: str) -> str | None:
+    """Extract state abbreviation from a GISJOIN county code like G0100010."""
+    if len(county_code) >= 3 and county_code.startswith("G"):
+        return FIPS_TO_STATE.get(county_code[1:3])
+    return None
+
+
+def build_prefix(release_year: int, release_name: str, gap_model: bool = False) -> str:
     """Return the S3 key prefix for the given release year and release name."""
+    if gap_model:
+        return (
+            f"nrel-pds-building-stock/end-use-load-profiles-for-us-building-stock/"
+            f"{release_year}/{release_name}/"
+            f"commercial_gap_model/by_county/"
+        )
     return (
         f"nrel-pds-building-stock/end-use-load-profiles-for-us-building-stock/"
         f"{release_year}/{release_name}/"
@@ -308,6 +337,20 @@ def parse_args() -> argparse.Namespace:
         help=f"Full release name, e.g. 'comstock_amy2018_release_3' or "
              f"'resstock_amy2018_release_1' (default: {DEFAULT_RELEASE_NAME})",
     )
+    parser.add_argument(
+        "--gap-model",
+        action="store_true",
+        help="Download the commercial gap model (by county) instead of "
+             "timeseries aggregates (by state).",
+    )
+    parser.add_argument(
+        "--counties",
+        nargs="+",
+        type=str,
+        metavar="CODE",
+        help="Only download files for these GISJOIN county codes "
+             "(e.g. --counties G0100010 G0100030). Only used with --gap-model.",
+    )
     return parser.parse_args()
 
 
@@ -318,14 +361,30 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
+    default_subdir = args.release_name
+    if args.gap_model:
+        default_subdir = args.release_name + "_gap_model"
     output_dir = Path(
         args.output_dir
         if args.output_dir
-        else os.path.join("downloads", str(args.release_year), args.release_name)
+        else os.path.join("downloads", str(args.release_year), default_subdir)
     ).expanduser().resolve()
     upgrades_filter = {str(u) for u in args.upgrades} if args.upgrades else None
     states_filter = {s.upper() for s in args.states} if args.states else None
-    prefix = build_prefix(args.release_year, args.release_name)
+    counties_filter = (
+        {c.upper() for c in args.counties} if args.gap_model and args.counties else None
+    )
+    # When --gap-model + --states, convert state abbreviations to FIPS prefixes
+    state_fips_prefixes: set[str] | None = None
+    if args.gap_model and states_filter:
+        state_fips_prefixes = set()
+        for st in states_filter:
+            fips = STATE_TO_FIPS.get(st)
+            if fips:
+                state_fips_prefixes.add(fips)
+            else:
+                print(f"Warning: unknown state abbreviation '{st}', skipping.")
+    prefix = build_prefix(args.release_year, args.release_name, gap_model=args.gap_model)
 
     # ------------------------------------------------------------------ #
     # Step 1 – discover files                                             #
@@ -335,31 +394,41 @@ def main() -> int:
 
     all_files = list_csv_files(prefix)
 
-    # Apply upgrade / state filters
+    # Apply upgrade / state / county filters
     def _keep(entry: dict) -> bool:
-        # Key looks like:  <prefix>upgrade=N/state=XX/filename.csv
-        rel = entry["key"][len(prefix):]         # upgrade=N/state=XX/...
+        rel = entry["key"][len(prefix):]         # upgrade=N/state=XX/... or upgrade=N/county=G.../...
         parts = rel.split("/")
         if len(parts) < 3:
             return True  # unexpected layout – include by default
 
         upgrade_part = parts[0]   # "upgrade=N"
-        state_part   = parts[1]   # "state=XX"
-
         upgrade_num = upgrade_part.split("=")[-1]
-        state_code  = state_part.split("=")[-1].upper()
-
         if upgrades_filter and upgrade_num not in upgrades_filter:
             return False
-        if states_filter and state_code not in states_filter:
-            return False
+
+        if args.gap_model:
+            # Gap model: upgrade=N/county=GXXXXXXX/filename.csv
+            county_part = parts[1]   # "county=GXXXXXXX"
+            county_code = county_part.split("=")[-1].upper()
+            if counties_filter and county_code not in counties_filter:
+                return False
+            if state_fips_prefixes:
+                county_state_fips = county_code[1:3] if county_code.startswith("G") else ""
+                if county_state_fips not in state_fips_prefixes:
+                    return False
+        else:
+            # Standard: upgrade=N/state=XX/filename.csv
+            state_part = parts[1]   # "state=XX"
+            state_code = state_part.split("=")[-1].upper()
+            if states_filter and state_code not in states_filter:
+                return False
         return True
 
     files = [f for f in all_files if _keep(f)]
 
     total_bytes = sum(f["size"] for f in files)
     print(f"Found {len(all_files):,} CSV files total on S3.")
-    if upgrades_filter or states_filter:
+    if upgrades_filter or states_filter or counties_filter:
         print(f"After filtering: {len(files):,} files selected.")
     print(f"Total size: {_fmt_bytes(total_bytes).strip()}\n")
 

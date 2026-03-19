@@ -21,8 +21,8 @@ Usage examples:
     # Convert ResStock annual parquet files
     python parquet_to_hyper.py --input-dir "./annual/resstock_amy2018_release_1 annual"
 
-    # Convert ComStock annual parquet files with a custom output name
-    python parquet_to_hyper.py --input-dir "./annual/comstock_amy2018_release_2 annual" --output comstock_annual.hyper
+    # Convert ComStock annual parquet files
+    python parquet_to_hyper.py --input-dir "./annual/comstock_amy2018_release_2 annual"
 """
 
 import argparse
