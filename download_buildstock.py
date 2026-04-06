@@ -1,50 +1,55 @@
 #!/usr/bin/env python3
 """
-Download CSV files from the NREL ComStock AMY2018 Release 3 dataset on AWS S3.
+Download files from NREL building stock datasets on AWS S3.
 
 Bucket  : oedi-data-lake  (public, no credentials required)
 Prefix  : nrel-pds-building-stock/end-use-load-profiles-for-us-building-stock/
-          2025/comstock_amy2018_release_3/timeseries_aggregates/by_state/
 
-Structure on S3:
-    by_state/
-        upgrade=0/
-            state=AK/
-                up0-ak-<building_type>.csv
-                ...
-            state=AL/
-                ...
-        upgrade=1/
-            ...
+Supports two dataset types:
+  - timeseries (default): timeseries_aggregates/by_state/
+  - annual: metadata_and_annual_results_aggregates/<aggregation>/
 
 Usage examples:
-    # Download everything (warning: ~500 GB+)
-    python download_buildstock.py
+    # Download timeseries (default), upgrade 0, dry run
+    python download_buildstock.py --upgrades 0 --dry-run
 
-    # Dry run – list files without downloading
-    python download_buildstock.py --dry-run
+    # Download annual results by state, basic version
+    python download_buildstock.py --dataset-type annual --aggregation by_state \
+        --annual-version basic --dry-run
 
-    # Download only upgrade 0, all states
-    python download_buildstock.py --upgrades 0
+    # Download annual results for a single state
+    python download_buildstock.py --dataset-type annual --aggregation by_state \
+        --annual-version full --states AL --dry-run
 
-    # Download upgrade 0 and 1 for CA and TX only
-    python download_buildstock.py --upgrades 0 1 --states CA TX
+    # Download annual results at national level
+    python download_buildstock.py --dataset-type annual --aggregation national \
+        --annual-version basic --dry-run
 
-    # Use 16 parallel workers and save to a custom directory
-    python download_buildstock.py --workers 16 --output-dir /data/buildstock
+    # Download timeseries for upgrade 0 and 1, AL and TX only
+    python download_buildstock.py --upgrades 0 1 --states AL TX
 
-    # Download a different release (ComStock or ResStock)
-    python download_buildstock.py --release-name comstock_amy2018_release_3
+    # Download a different release
     python download_buildstock.py --release-name resstock_amy2018_release_1
 
+    # Gap model by county
+    python download_buildstock.py --gap-model --upgrades 0 --dry-run
+    
     # My saved usage
     python download_buildstock.py --upgrades 0 --dry-run --release-year 2025 --release-name comstock_amy2018_release_2
     python download_buildstock.py --upgrades 0 --dry-run --release-year 2025 --release-name resstock_amy2018_release_1
+    
+    python download_buildstock.py \
+        --release-year 2025 --release-name comstock_amy2018_release_3 \
+        --dataset-type annual --aggregation by_state_and_puma \
+        --upgrades 0 \
+        --states AL
+
 """
 
 import argparse
 import concurrent.futures
 import os
+import re
 import sys
 import time
 import urllib.parse
@@ -61,6 +66,14 @@ BASE_URL = f"https://{BUCKET}.s3.amazonaws.com"
 
 DEFAULT_RELEASE_YEAR = 2025
 DEFAULT_RELEASE_NAME = "comstock_amy2018_release_3"
+
+AGGREGATION_CHOICES = (
+    "by_state_and_county",
+    "by_state_and_puma",
+    "by_state",
+    "national",
+)
+ANNUAL_VERSION_CHOICES = ("basic", "full")
 
 # FIPS state code -> two-letter abbreviation (for gap model county-to-state mapping)
 FIPS_TO_STATE = {
@@ -86,19 +99,29 @@ def county_to_state_abbr(county_code: str) -> str | None:
     return None
 
 
-def build_prefix(release_year: int, release_name: str, gap_model: bool = False) -> str:
+def build_prefix(
+    release_year: int,
+    release_name: str,
+    gap_model: bool = False,
+    dataset_type: str = "timeseries",
+    aggregation: str = "by_state",
+) -> str:
     """Return the S3 key prefix for the given release year and release name."""
-    if gap_model:
-        return (
-            f"nrel-pds-building-stock/end-use-load-profiles-for-us-building-stock/"
-            f"{release_year}/{release_name}/"
-            f"commercial_gap_model/by_county/"
-        )
-    return (
+    base = (
         f"nrel-pds-building-stock/end-use-load-profiles-for-us-building-stock/"
         f"{release_year}/{release_name}/"
-        f"timeseries_aggregates/by_state/"
     )
+    if gap_model:
+        return base + "commercial_gap_model/by_county/"
+    if dataset_type == "annual":
+        # ResStock uses metadata_and_annual_results/;
+        # ComStock uses metadata_and_annual_results_aggregates/
+        if "resstock" in release_name:
+            annual_folder = "metadata_and_annual_results"
+        else:
+            annual_folder = "metadata_and_annual_results_aggregates"
+        return base + f"{annual_folder}/{aggregation}/"
+    return base + "timeseries_aggregates/by_state/"
 
 # ---------------------------------------------------------------------------
 # S3 listing helpers
@@ -123,9 +146,11 @@ def _s3_list_page(prefix: str, continuation_token: str | None = None) -> ET.Elem
         return ET.fromstring(resp.read().decode("utf-8"))
 
 
-def list_csv_files(prefix: str) -> list[dict]:
+def list_files(prefix: str, extensions: tuple[str, ...] | None = (".csv",)) -> list[dict]:
     """
-    Recursively list all .csv objects under *prefix* using the S3 REST API.
+    Recursively list objects under *prefix* using the S3 REST API.
+    If *extensions* is given, only include files matching those suffixes.
+    Pass ``extensions=None`` to include all files.
     Returns a list of dicts with keys: ``key``, ``size``.
     Handles pagination automatically.
     """
@@ -139,7 +164,7 @@ def list_csv_files(prefix: str) -> list[dict]:
         for content in tree.findall(f"{ns}Contents"):
             key = content.find(f"{ns}Key").text  # type: ignore[union-attr]
             size = int(content.find(f"{ns}Size").text)  # type: ignore[union-attr]
-            if key and key.endswith(".csv"):
+            if key and (extensions is None or key.endswith(extensions)):
                 files.append({"key": key, "size": size})
 
         is_truncated = (tree.findtext(f"{ns}IsTruncated") or "false").lower() == "true"
@@ -338,6 +363,34 @@ def parse_args() -> argparse.Namespace:
              f"'resstock_amy2018_release_1' (default: {DEFAULT_RELEASE_NAME})",
     )
     parser.add_argument(
+        "--dataset-type",
+        choices=("timeseries", "annual"),
+        default="timeseries",
+        help="Type of dataset to download: 'timeseries' for timeseries "
+             "aggregates (default), 'annual' for metadata and annual results.",
+    )
+    parser.add_argument(
+        "--aggregation",
+        choices=AGGREGATION_CHOICES,
+        default=None,
+        help="Aggregation level for annual results. Required when "
+             "--dataset-type=annual. Choices: "
+             + ", ".join(AGGREGATION_CHOICES) + ".",
+    )
+    parser.add_argument(
+        "--annual-version",
+        choices=ANNUAL_VERSION_CHOICES,
+        default="full",
+        metavar="VER",
+        help="Download 'basic' or 'full' annual result files "
+             "(default: full).",
+    )
+    parser.add_argument(
+        "--annual-csv",
+        action="store_true",
+        help="Download CSV files instead of Parquet for annual results.",
+    )
+    parser.add_argument(
         "--gap-model",
         action="store_true",
         help="Download the commercial gap model (by county) instead of "
@@ -351,7 +404,21 @@ def parse_args() -> argparse.Namespace:
         help="Only download files for these GISJOIN county codes "
              "(e.g. --counties G0100010 G0100030). Only used with --gap-model.",
     )
-    return parser.parse_args()
+
+    args = parser.parse_args()
+
+    if args.dataset_type == "annual" and args.aggregation is None:
+        parser.error("--aggregation is required when --dataset-type=annual")
+    if args.aggregation is not None and args.dataset_type != "annual":
+        parser.error("--aggregation is only used with --dataset-type=annual")
+    if args.annual_version != "full" and args.dataset_type != "annual":
+        parser.error("--annual-version is only used with --dataset-type=annual")
+    if args.annual_csv and args.dataset_type != "annual":
+        parser.error("--annual-csv is only used with --dataset-type=annual")
+    if args.gap_model and args.dataset_type == "annual":
+        parser.error("--gap-model and --dataset-type=annual cannot be combined")
+
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -384,50 +451,90 @@ def main() -> int:
                 state_fips_prefixes.add(fips)
             else:
                 print(f"Warning: unknown state abbreviation '{st}', skipping.")
-    prefix = build_prefix(args.release_year, args.release_name, gap_model=args.gap_model)
+    annual_version = getattr(args, "annual_version", None)
+    prefix = build_prefix(
+        args.release_year,
+        args.release_name,
+        gap_model=args.gap_model,
+        dataset_type=args.dataset_type,
+        aggregation=args.aggregation or "by_state",
+    )
 
     # ------------------------------------------------------------------ #
     # Step 1 – discover files                                             #
     # ------------------------------------------------------------------ #
-    print(f"Listing CSV files under s3://{BUCKET}/{prefix}")
+    # Choose file extensions to list
+    if args.dataset_type == "annual":
+        if args.annual_csv:
+            extensions = (".csv", ".csv.gz")
+        else:
+            extensions = (".parquet",)
+    else:
+        extensions = (".csv",)
+
+    print(f"Listing files under s3://{BUCKET}/{prefix}")
     print("(This may take a moment for large prefixes…)\n")
 
-    all_files = list_csv_files(prefix)
+    all_files = list_files(prefix, extensions=extensions)
 
-    # Apply upgrade / state / county filters
+    # Apply upgrade / state / county / version filters
     def _keep(entry: dict) -> bool:
-        rel = entry["key"][len(prefix):]         # upgrade=N/state=XX/... or upgrade=N/county=G.../...
+        rel = entry["key"][len(prefix):]         # e.g. full/parquet/state=XX/... or upgrade=N/state=XX/...
         parts = rel.split("/")
-        if len(parts) < 3:
-            return True  # unexpected layout – include by default
 
-        upgrade_part = parts[0]   # "upgrade=N"
-        upgrade_num = upgrade_part.split("=")[-1]
-        if upgrades_filter and upgrade_num not in upgrades_filter:
-            return False
+        # Annual-version filter (basic / full) – the first path component
+        if annual_version:
+            if parts[0] != annual_version:
+                return False
+
+        # Parse path components into a dict of partition keys
+        partitions: dict[str, str] = {}
+        for p in parts[:-1]:
+            if "=" in p:
+                k, v = p.split("=", 1)
+                partitions[k] = v
+
+        # Upgrade filter – check partition key first, then filename
+        if upgrades_filter:
+            if "upgrade" in partitions:
+                if partitions["upgrade"] not in upgrades_filter:
+                    return False
+            else:
+                # Annual files: upgrade number is in the filename, e.g.
+                # AL_upgrade0_agg.parquet, AL_upgrade10_agg_basic.csv.gz,
+                # or AK_upgrade0.parquet (ResStock, no _agg suffix)
+                m = re.search(r'_upgrade(\d+)', parts[-1])
+                if m:
+                    if m.group(1) not in upgrades_filter:
+                        return False
 
         if args.gap_model:
             # Gap model: upgrade=N/county=GXXXXXXX/filename.csv
-            county_part = parts[1]   # "county=GXXXXXXX"
-            county_code = county_part.split("=")[-1].upper()
+            county_code = partitions.get("county", "").upper()
             if counties_filter and county_code not in counties_filter:
                 return False
-            if state_fips_prefixes:
+            if state_fips_prefixes and county_code:
                 county_state_fips = county_code[1:3] if county_code.startswith("G") else ""
                 if county_state_fips not in state_fips_prefixes:
                     return False
         else:
-            # Standard: upgrade=N/state=XX/filename.csv
-            state_part = parts[1]   # "state=XX"
-            state_code = state_part.split("=")[-1].upper()
-            if states_filter and state_code not in states_filter:
-                return False
+            # State filter – check partition key or filename
+            if states_filter:
+                state_code = partitions.get("state", "").upper()
+                if state_code:
+                    if state_code not in states_filter:
+                        return False
+                else:
+                    # No state= partition; check filename for state code
+                    fn_upper = parts[-1].upper()
+                    if not any(st in fn_upper for st in states_filter):
+                        return False
         return True
 
     files = [f for f in all_files if _keep(f)]
 
     total_bytes = sum(f["size"] for f in files)
-    print(f"Found {len(all_files):,} CSV files total on S3.")
+    print(f"Found {len(all_files):,} files total on S3.")
     if upgrades_filter or states_filter or counties_filter:
         print(f"After filtering: {len(files):,} files selected.")
     print(f"Total size: {_fmt_bytes(total_bytes).strip()}\n")
