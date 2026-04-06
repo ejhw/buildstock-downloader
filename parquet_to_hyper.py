@@ -1,38 +1,33 @@
 #!/usr/bin/env python3
 """
-Convert all Parquet files in a folder into a single Tableau .hyper file.
+Convert all Parquet files under a directory tree into a single Tableau .hyper file.
 
 The script:
-  1. Discovers every *.parquet file in the specified input folder.
-  2. Converts each one to a temporary .hyper file using Hyper's COPY FROM
-     PARQUET (schema is auto-detected from the Parquet metadata).
-  3. Unions all the temporary .hyper files into a single output .hyper file.
+  1. Recursively discovers every *.parquet file under the input directory.
+  2. Reads them as a unified PyArrow dataset (handles nested Hive-style
+     partitioning like state=XX/puma=YYY/).
+  3. Streams record batches into a single .hyper file via the Hyper Inserter.
 
 Usage examples:
-    # Convert all parquet files in a folder
-    python parquet_to_hyper.py --input-dir ./annual/resstock_amy2018_release_1\\ annual
+    # Convert all parquet files under a download tree
+    python parquet_to_hyper.py --input-dir ./downloads/2025/comstock_amy2018_release_3/metadata_and_annual_results_aggregates
 
     # Specify a custom output file name
-    python parquet_to_hyper.py --input-dir ./annual/comstock_amy2018_release_2\\ annual --output comstock_annual.hyper
+    python parquet_to_hyper.py --input-dir ./downloads/2025/comstock_amy2018_release_3/metadata_and_annual_results_aggregates \\
+        --output comstock_annual.hyper
 
-    # Custom table name in the output Hyper file
-    python parquet_to_hyper.py --input-dir ./annual/resstock_amy2018_release_1\\ annual --table-name annual_data
-
-    # Convert ResStock annual parquet files
-    python parquet_to_hyper.py --input-dir "./annual/resstock_amy2018_release_1 annual"
-
-    # Convert ComStock annual parquet files
-    python parquet_to_hyper.py --input-dir "./annual/comstock_amy2018_release_2 annual"
+    # Custom table name
+    python parquet_to_hyper.py --input-dir ./my_data --table-name annual_data
 """
 
 import argparse
-import os
 import sys
 import time
 from pathlib import Path
 
-import pyarrow.parquet as pq
 import pyarrow as pa
+import pyarrow.dataset as ds
+import pyarrow.parquet as pq
 from tableauhyperapi import (
     Connection,
     CreateMode,
@@ -62,9 +57,50 @@ def _fmt_time(seconds: float) -> str:
 
 
 def discover_parquet_files(input_dir: Path) -> list[Path]:
-    """Return a sorted list of .parquet files in *input_dir*."""
-    files = sorted(input_dir.glob("*.parquet"))
-    return files
+    """Return a sorted list of .parquet files under *input_dir* (recursive)."""
+    return sorted(input_dir.rglob("*.parquet"))
+
+
+def infer_output_folder(input_dir: Path, parquet_files: list[Path]) -> Path:
+    """
+    Infer output folder, including aggregation/version subfolders when present.
+
+    Handles two cases:
+    - input_dir is the aggregation root (e.g. .../metadata_and_annual_results_aggregates):
+      appends <aggregation>/<version>/ from file paths.
+    - input_dir already points inside a version folder (e.g. .../by_state_and_puma/full):
+      uses input_dir as-is.
+    """
+    aggregations = {
+        "by_state_and_county",
+        "by_state_and_puma",
+        "by_state",
+        "national",
+    }
+    versions = {"basic", "full"}
+
+    # If input_dir itself already ends with a known version, use it directly.
+    if input_dir.name in versions:
+        return input_dir
+    # Also check if a version already appears anywhere in the path.
+    if any(p in versions for p in input_dir.parts):
+        return input_dir
+
+    if not parquet_files:
+        return input_dir / "full"
+
+    rel_parts = parquet_files[0].relative_to(input_dir).parts
+    agg = next((p for p in rel_parts if p in aggregations), None)
+    version = next((p for p in rel_parts if p in versions), None)
+
+    out_dir = input_dir
+    if agg and agg not in input_dir.parts:
+        out_dir = out_dir / agg
+    if version:
+        out_dir = out_dir / version
+    else:
+        out_dir = out_dir / "full"
+    return out_dir
 
 
 _WRITE_BATCH_SIZE = 500_000
@@ -99,36 +135,72 @@ def _build_table_def(schema: pa.Schema, table_name: str) -> TableDefinition:
     return TableDefinition(TableName("public", table_name), columns)
 
 
-def parquet_to_hyper(
-    parquet_path: Path,
+def _cast_batch(batch: pa.RecordBatch) -> pa.RecordBatch:
+    """Cast float32 columns to float64 (Hyper doesn't support float32)."""
+    new_arrays = []
+    new_fields = []
+    for i, field in enumerate(batch.schema):
+        col = batch.column(i)
+        if pa.types.is_float32(field.type):
+            col = col.cast(pa.float64())
+            field = field.with_type(pa.float64())
+        new_arrays.append(col)
+        new_fields.append(field)
+    return pa.RecordBatch.from_arrays(new_arrays, schema=pa.schema(new_fields))
+
+
+def parquet_dir_to_hyper(
+    input_dir: Path,
     hyper_path: Path,
     table_name: str,
+    batch_size: int = _WRITE_BATCH_SIZE,
+    state_filter: str | None = None,
 ) -> int:
     """
-    Load a single Parquet file into a new .hyper file.
+    Read all Parquet files under *input_dir* as a PyArrow dataset and
+    stream-insert them into a single .hyper file.
 
-    Reads via PyArrow so column types (including float32) are properly mapped
-    to Hyper SqlTypes.  Float32 values are cast to float64 since Hyper does
-    not support 32-bit floats.
+    Uses Hive-style partitioning discovery so partition columns
+    (state, puma, county, etc.) become regular columns in the output.
 
-    Returns the number of rows inserted.
+    If *state_filter* is given (e.g. "AL"), only rows for that state
+    are included.
+
+    Returns the total number of rows inserted.
     """
     hyper_path.parent.mkdir(parents=True, exist_ok=True)
 
-    table = pq.read_table(parquet_path)
+    # Open the dataset – PyArrow will discover the Hive partitioning.
+    # exclude_invalid_files=True prevents PyArrow from trying to parse
+    # any .hyper (or other non-parquet) files that may sit in the same tree.
+    dataset = ds.dataset(
+        input_dir,
+        format="parquet",
+        partitioning="hive",
+        exclude_invalid_files=True,
+    )
 
-    # Cast float32 columns → float64 (Hyper doesn't support float32)
-    new_fields = []
-    for field in table.schema:
+    # Build optional row filter
+    row_filter = None
+    if state_filter:
+        row_filter = ds.field("state") == state_filter
+
+    # Read one batch to discover the unified schema
+    scanner = dataset.scanner(batch_size=batch_size, filter=row_filter)
+    schema = scanner.projected_schema
+
+    # Cast float32 → float64 in schema for table definition
+    cast_fields = []
+    for field in schema:
         if pa.types.is_float32(field.type):
-            new_fields.append(field.with_type(pa.float64()))
+            cast_fields.append(field.with_type(pa.float64()))
         else:
-            new_fields.append(field)
-    new_schema = pa.schema(new_fields)
-    table = table.cast(new_schema)
+            cast_fields.append(field)
+    cast_schema = pa.schema(cast_fields)
 
-    table_def = _build_table_def(table.schema, table_name)
-    total_rows = table.num_rows
+    table_def = _build_table_def(cast_schema, table_name)
+    total_rows = 0
+    batches_written = 0
 
     with HyperProcess(telemetry=Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
         with Connection(
@@ -137,74 +209,27 @@ def parquet_to_hyper(
             create_mode=CreateMode.CREATE_AND_REPLACE,
         ) as connection:
             connection.catalog.create_table(table_def)
+            col_names = cast_schema.names
 
-            # Convert to Python rows and write in batches
-            columns = table.to_pydict()
-            col_names = table.schema.names
             with Inserter(connection, table_def) as inserter:
-                for start in range(0, total_rows, _WRITE_BATCH_SIZE):
-                    end = min(start + _WRITE_BATCH_SIZE, total_rows)
-                    batch = [
+                for batch in scanner.to_batches():
+                    batch = _cast_batch(batch)
+                    num_rows = batch.num_rows
+                    # Convert columnar batch to rows for inserter
+                    columns = {name: batch.column(name).to_pylist() for name in col_names}
+                    rows = [
                         tuple(columns[c][i] for c in col_names)
-                        for i in range(start, end)
+                        for i in range(num_rows)
                     ]
-                    inserter.add_rows(batch)
+                    inserter.add_rows(rows)
+                    total_rows += num_rows
+                    batches_written += 1
+                    if batches_written % 10 == 0:
+                        print(f"    … {total_rows:,} rows ingested", end="\r", flush=True)
                 inserter.execute()
 
+    print(f"    … {total_rows:,} rows ingested")
     return total_rows
-
-
-def union_hyper_files(
-    hyper_files: list[Path],
-    output_path: Path,
-    table_name: str,
-) -> int:
-    """
-    Union all .hyper files into a single *output_path* using Hyper SQL.
-
-    Returns the total row count.
-    """
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    if output_path.exists():
-        output_path.unlink()
-
-    if len(hyper_files) == 1:
-        # Nothing to union — just rename / copy the single file
-        import shutil
-        shutil.copy2(hyper_files[0], output_path)
-        with HyperProcess(telemetry=Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
-            with Connection(hyper.endpoint, str(output_path), CreateMode.NONE) as conn:
-                row_count = conn.execute_scalar_query(
-                    f'SELECT COUNT(*) FROM "public"."{table_name}"'
-                )
-        return int(row_count)
-
-    with HyperProcess(telemetry=Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
-        with Connection(endpoint=hyper.endpoint) as conn:
-            # Attach all input databases
-            for idx, hf in enumerate(hyper_files):
-                conn.catalog.attach_database(str(hf), alias=f"input{idx}")
-
-            # Create and attach the output database
-            conn.catalog.create_database(str(output_path))
-            conn.catalog.attach_database(str(output_path), alias="output")
-
-            # Build UNION ALL query across all inputs
-            union_query = " UNION ALL\n".join(
-                f'SELECT * FROM "input{idx}"."public"."{table_name}"'
-                for idx in range(len(hyper_files))
-            )
-            create_sql = (
-                f'CREATE TABLE "output"."public"."{table_name}" AS\n'
-                f"{union_query}"
-            )
-            conn.execute_command(create_sql)
-
-            row_count = conn.execute_scalar_query(
-                f'SELECT COUNT(*) FROM "output"."public"."{table_name}"'
-            )
-
-    return int(row_count)
 
 
 # ---------------------------------------------------------------------------
@@ -219,18 +244,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input-dir",
         required=True,
-        help="Folder containing .parquet files to convert",
+        help="Root folder containing .parquet files (searched recursively)",
     )
     parser.add_argument(
         "--output",
         default=None,
         help="Output .hyper file path "
-             "(default: <input-dir folder name>.hyper)",
+             "(default: inferred aggregation/version folder under input-dir)",
     )
     parser.add_argument(
         "--table-name",
         default="Extract",
         help='Table name inside the Hyper file (default: "Extract")',
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=_WRITE_BATCH_SIZE,
+        help=f"Number of rows per insert batch (default: {_WRITE_BATCH_SIZE:,})",
+    )
+    parser.add_argument(
+        "--state",
+        type=str,
+        default=None,
+        metavar="XX",
+        help="Only include data for this two-letter state code (e.g. --state AL).",
     )
     return parser.parse_args()
 
@@ -247,51 +285,39 @@ def main() -> int:
         print(f"Error: input directory does not exist: {input_dir}", file=sys.stderr)
         return 1
 
-    # Default output: <folder_name>.hyper in the current working directory
-    if args.output:
-        output_path = Path(args.output).expanduser().resolve()
-    else:
-        output_path = Path(f"{input_dir.name}.hyper").resolve()
-
     table_name = args.table_name
+    state_filter = args.state.upper() if args.state else None
 
     # Discover parquet files
     parquet_files = discover_parquet_files(input_dir)
     if not parquet_files:
-        print(f"No .parquet files found in {input_dir}")
+        print(f"No .parquet files found under {input_dir}")
         return 1
 
-    print(f"Found {len(parquet_files)} parquet file(s) in {input_dir}")
+    # Default output: place in inferred aggregation/version folder, append state if filtered
+    if args.output:
+        output_path = Path(args.output).expanduser().resolve()
+    else:
+        output_dir = infer_output_folder(input_dir, parquet_files)
+        name = input_dir.name
+        if state_filter:
+            name += f"_{state_filter}"
+        output_path = output_dir / f"{name}.hyper"
 
-    # Step 1: Convert each parquet → temp .hyper
+    print(f"Found {len(parquet_files):,} parquet file(s) under {input_dir}")
+    if state_filter:
+        print(f"Filtering to state: {state_filter}")
+    print(f"Output: {output_path}")
+    print()
+
     t0 = time.monotonic()
-    temp_hypers: list[Path] = []
-
-    for i, pf in enumerate(parquet_files, 1):
-        hyper_path = input_dir / f".tmp_{pf.stem}.hyper"
-        print(f"  [{i}/{len(parquet_files)}] {pf.name} → {hyper_path.name} ...", end=" ", flush=True)
-        t1 = time.monotonic()
-        rows = parquet_to_hyper(pf, hyper_path, table_name)
-        elapsed = time.monotonic() - t1
-        print(f"{rows:,} rows in {_fmt_time(elapsed)}")
-        temp_hypers.append(hyper_path)
-
-    # Step 2: Union into final .hyper
-    print(f"\nUnioning {len(temp_hypers)} file(s) into {output_path.name} ...")
-    t_union = time.monotonic()
-    total_rows = union_hyper_files(temp_hypers, output_path, table_name)
-    union_elapsed = time.monotonic() - t_union
-    print(f"  Union complete: {total_rows:,} rows in {_fmt_time(union_elapsed)}")
-
-    # Clean up temp files
-    for tmp in temp_hypers:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-
+    total_rows = parquet_dir_to_hyper(
+        input_dir, output_path, table_name, args.batch_size,
+        state_filter=state_filter,
+    )
     elapsed = time.monotonic() - t0
-    print(f"\nDone in {_fmt_time(elapsed)}  →  {output_path}")
+
+    print(f"\nDone: {total_rows:,} rows in {_fmt_time(elapsed)}  →  {output_path}")
     return 0
 
 
