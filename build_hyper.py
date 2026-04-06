@@ -22,7 +22,7 @@ Usage examples:
     python build_hyper.py --input-dir ./downloads/2025/comstock_amy2018_release_3 --output comstock.hyper
 
     # Only process files matching a glob (e.g. one state)
-    python build_hyper.py --input-dir ./downloads/2025/comstock_amy2018_release_3 --glob "upgrade=0/state=AL/*.csv"
+    python build_hyper.py --input-dir ./downloads/2025/comstock_amy2018_release_2 --glob "upgrade=0/state=AL/*.csv"
     python build_hyper.py --input-dir ./downloads/2025/resstock_amy2018_release_1 --glob "upgrade=0/state=AL/*.csv"
 
     # Use chunked processing to limit memory usage
