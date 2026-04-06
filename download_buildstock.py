@@ -42,7 +42,7 @@ Usage examples:
         --release-year 2025 --release-name comstock_amy2018_release_3 \
         --dataset-type annual --aggregation by_state_and_puma \
         --upgrades 0 \
-        --states AL
+        --states WY
 
 """
 
@@ -177,6 +177,31 @@ def list_files(prefix: str, extensions: tuple[str, ...] | None = (".csv",)) -> l
         continuation_token = next_token_elem.text
 
     return files
+
+
+def list_files_for_prefixes(
+    prefixes: list[str],
+    extensions: tuple[str, ...] | None,
+    workers: int = 8,
+) -> list[dict]:
+    """List files for one or more prefixes and de-duplicate by object key."""
+    if not prefixes:
+        return []
+    if len(prefixes) == 1:
+        return list_files(prefixes[0], extensions=extensions)
+
+    merged: dict[str, int] = {}
+    max_workers = min(max(1, workers), len(prefixes), 16)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(list_files, p, extensions): p
+            for p in prefixes
+        }
+        for future in concurrent.futures.as_completed(futures):
+            for entry in future.result():
+                merged[entry["key"]] = entry["size"]
+
+    return [{"key": k, "size": s} for k, s in merged.items()]
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +461,8 @@ def main() -> int:
             dataset_folder = "metadata_and_annual_results"
         else:
             dataset_folder = "metadata_and_annual_results_aggregates"
+        # Keep annual outputs partitioned by aggregation level.
+        dataset_folder = os.path.join(dataset_folder, args.aggregation or "by_state")
     else:
         dataset_folder = "timeseries_aggregates"
     output_dir = Path(
@@ -479,10 +506,61 @@ def main() -> int:
     else:
         extensions = (".csv",)
 
+    # Narrow S3 listing prefixes when filters allow it to avoid scanning
+    # whole aggregations for state-specific runs.
+    listing_prefixes = [prefix]
+    if args.dataset_type == "annual":
+        fmt_dir = "csv" if args.annual_csv else "parquet"
+        if states_filter:
+            versions = [annual_version] if annual_version else ["basic", "full"]
+            listing_prefixes = [
+                f"{prefix}{ver}/{fmt_dir}/state={st}/"
+                for ver in versions
+                for st in sorted(states_filter)
+            ]
+        elif annual_version:
+            listing_prefixes = [f"{prefix}{annual_version}/{fmt_dir}/"]
+    elif args.gap_model:
+        if upgrades_filter and counties_filter:
+            listing_prefixes = [
+                f"{prefix}upgrade={up}/county={county}/"
+                for up in sorted(upgrades_filter, key=int)
+                for county in sorted(counties_filter)
+            ]
+        elif upgrades_filter and state_fips_prefixes:
+            listing_prefixes = [
+                f"{prefix}upgrade={up}/county=G{fips}"
+                for up in sorted(upgrades_filter, key=int)
+                for fips in sorted(state_fips_prefixes)
+            ]
+        elif upgrades_filter:
+            listing_prefixes = [
+                f"{prefix}upgrade={up}/"
+                for up in sorted(upgrades_filter, key=int)
+            ]
+    else:
+        if upgrades_filter and states_filter:
+            listing_prefixes = [
+                f"{prefix}upgrade={up}/state={st}/"
+                for up in sorted(upgrades_filter, key=int)
+                for st in sorted(states_filter)
+            ]
+        elif upgrades_filter:
+            listing_prefixes = [
+                f"{prefix}upgrade={up}/"
+                for up in sorted(upgrades_filter, key=int)
+            ]
+
     print(f"Listing files under s3://{BUCKET}/{prefix}")
     print("(This may take a moment for large prefixes…)\n")
+    if len(listing_prefixes) > 1:
+        print(f"Using {len(listing_prefixes)} targeted listing prefix(es).")
 
-    all_files = list_files(prefix, extensions=extensions)
+    all_files = list_files_for_prefixes(
+        listing_prefixes,
+        extensions=extensions,
+        workers=args.workers,
+    )
 
     # Apply upgrade / state / county / version filters
     def _keep(entry: dict) -> bool:
