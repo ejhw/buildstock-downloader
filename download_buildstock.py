@@ -430,11 +430,18 @@ def main() -> int:
 
     default_subdir = args.release_name
     if args.gap_model:
-        default_subdir = args.release_name + "_gap_model"
+        dataset_folder = "commercial_gap_model"
+    elif args.dataset_type == "annual":
+        if "resstock" in args.release_name:
+            dataset_folder = "metadata_and_annual_results"
+        else:
+            dataset_folder = "metadata_and_annual_results_aggregates"
+    else:
+        dataset_folder = "timeseries_aggregates"
     output_dir = Path(
         args.output_dir
         if args.output_dir
-        else os.path.join("downloads", str(args.release_year), default_subdir)
+        else os.path.join("downloads", str(args.release_year), default_subdir, dataset_folder)
     ).expanduser().resolve()
     upgrades_filter = {str(u) for u in args.upgrades} if args.upgrades else None
     states_filter = {s.upper() for s in args.states} if args.states else None
