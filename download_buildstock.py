@@ -485,7 +485,7 @@ def main() -> int:
                 state_fips_prefixes.add(fips)
             else:
                 print(f"Warning: unknown state abbreviation '{st}', skipping.")
-    annual_version = getattr(args, "annual_version", None)
+    annual_version = args.annual_version if args.dataset_type == "annual" else None
     prefix = build_prefix(
         args.release_year,
         args.release_name,
