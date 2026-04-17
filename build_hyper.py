@@ -154,7 +154,7 @@ class Progress:
         )
 
 
-def process_csv(path: Path) -> pd.DataFrame:
+def process_csv(path: Path, allowed_end_uses: set[str] | None = None) -> pd.DataFrame:
     """
     Read one CSV, melt electricity end-use columns, drop other out.* columns.
 
@@ -186,6 +186,12 @@ def process_csv(path: Path) -> pd.DataFrame:
 
     # Clean up end_use labels
     df_long["end_use"] = df_long["end_use"].map(_extract_end_use)
+
+    # Optional whitelist filter for end uses
+    if allowed_end_uses:
+        df_long = df_long[
+            df_long["end_use"].str.lower().isin(allowed_end_uses)
+        ]
 
     return df_long
 
@@ -423,6 +429,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep 15-minute intervals instead of aggregating to hourly (default: aggregate to hourly).",
     )
+    parser.add_argument(
+        "--enduse",
+        nargs="+",
+        default=None,
+        metavar="END_USE",
+        help="Keep only specified end uses (case-insensitive), e.g. --enduse net heating total.",
+    )
     return parser.parse_args()
 
 
@@ -431,12 +444,16 @@ def parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 def _read_chunk(
-    chunk_files: list[Path], input_dir: Path, progress: Progress, keep_15min: bool = False
+    chunk_files: list[Path],
+    input_dir: Path,
+    progress: Progress,
+    keep_15min: bool = False,
+    allowed_end_uses: set[str] | None = None,
 ) -> pd.DataFrame:
     """Read and process a chunk of CSV files.  Intended for a background thread."""
     frames: list[pd.DataFrame] = []
     for csv_path in chunk_files:
-        df_part = process_csv(csv_path)
+        df_part = process_csv(csv_path, allowed_end_uses=allowed_end_uses)
         progress.update(csv_path, input_dir, len(df_part))
         frames.append(df_part)
     df = pd.concat(frames, ignore_index=True)
@@ -455,6 +472,11 @@ def _read_chunk(
 
 def main() -> int:
     args = parse_args()
+    allowed_end_uses = (
+        {value.strip().lower() for value in args.enduse if value.strip()}
+        if args.enduse
+        else None
+    )
 
     input_dir = Path(args.input_dir).expanduser().resolve()
 
@@ -518,7 +540,12 @@ def main() -> int:
         with ThreadPoolExecutor(max_workers=1) as reader_pool:
             # Kick off reading the first chunk
             pending = reader_pool.submit(
-                _read_chunk, chunks[0], input_dir, progress, args.keep_15min
+                _read_chunk,
+                chunks[0],
+                input_dir,
+                progress,
+                args.keep_15min,
+                allowed_end_uses,
             )
 
             for chunk_idx in range(len(chunks)):
@@ -528,7 +555,12 @@ def main() -> int:
                 # Submit the *next* chunk for reading while we write this one
                 if chunk_idx + 1 < len(chunks):
                     pending = reader_pool.submit(
-                        _read_chunk, chunks[chunk_idx + 1], input_dir, progress, args.keep_15min
+                        _read_chunk,
+                        chunks[chunk_idx + 1],
+                        input_dir,
+                        progress,
+                        args.keep_15min,
+                        allowed_end_uses,
                     )
 
                 if not printed_columns:
