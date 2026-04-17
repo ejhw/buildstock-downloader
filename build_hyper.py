@@ -22,8 +22,7 @@ Usage examples:
     python build_hyper.py --input-dir ./downloads/2025/comstock_amy2018_release_3 --output comstock.hyper
 
     # Only process files matching a glob (e.g. one state)
-    python build_hyper.py --input-dir ./downloads/2025/comstock_amy2018_release_2 --glob "upgrade=0/state=AL/*.csv"
-    python build_hyper.py --input-dir ./downloads/2025/resstock_amy2018_release_1 --glob "upgrade=0/state=AL/*.csv"
+    python build_hyper.py --input-dir ./downloads/2025/resstock_amy2012_release_1 --glob "timeseries_aggregates/upgrade=*/state=AL/*.csv"
 
     # Use chunked processing to limit memory usage
     python build_hyper.py --input-dir ./downloads/2025/comstock_amy2018_release_3 --chunk-size 50
@@ -157,6 +156,9 @@ def process_csv(path: Path) -> pd.DataFrame:
     # Drop non-electricity output columns
     df = df.drop(columns=other_out_cols)
 
+    # Filter out electricity columns with 'savings' before melting
+    elec_cols = [c for c in elec_cols if 'savings' not in c.lower()]
+
     # Melt electricity columns into long format
     df_long = df.melt(
         id_vars=id_cols,
@@ -169,6 +171,38 @@ def process_csv(path: Path) -> pd.DataFrame:
     df_long["end_use"] = df_long["end_use"].map(_extract_end_use)
 
     return df_long
+
+
+def aggregate_to_hourly(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate 15-minute interval data to hourly using hour-ending convention.
+    
+    E.g., timestamps 00:15, 00:30, 00:45, 01:00 are summed and labeled as 01:00.
+    Returns a new aggregated DataFrame.
+    """
+    # Find the timestamp column (case-insensitive)
+    ts_col = next((c for c in df.columns if c.lower() == 'timestamp'), None)
+    if ts_col is None:
+        return df
+    
+    # Convert to datetime if not already
+    df = df.copy()
+    df[ts_col] = pd.to_datetime(df[ts_col])
+    
+    # Ceil to the next hour (hour-ending convention)
+    df[ts_col] = df[ts_col].dt.ceil('h')
+    
+    # Group by all non-numeric columns plus 'upgrade', sum other numeric columns
+    group_cols = [c for c in df.columns if df[c].dtype == 'object' or c == ts_col]
+    if 'upgrade' in df.columns and 'upgrade' not in group_cols:
+        group_cols.append('upgrade')
+    numeric_cols = [c for c in df.columns if str(df[c].dtype) in ['int64', 'float64', 'int32', 'float32'] and c not in group_cols]
+    
+    # Use groupby with agg to preserve structure
+    agg_dict = {col: 'sum' for col in numeric_cols}
+    df_agg = df.groupby(group_cols, as_index=False).agg(agg_dict)
+    
+    return df_agg
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +401,11 @@ def parse_args() -> argparse.Namespace:
              "separate temp .hyper file, then merge at the end. "
              "0 = process all at once (default).",
     )
+    parser.add_argument(
+        "--keep-15min",
+        action="store_true",
+        help="Keep 15-minute intervals instead of aggregating to hourly (default: aggregate to hourly).",
+    )
     return parser.parse_args()
 
 
@@ -375,7 +414,7 @@ def parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 def _read_chunk(
-    chunk_files: list[Path], input_dir: Path, progress: Progress
+    chunk_files: list[Path], input_dir: Path, progress: Progress, keep_15min: bool = False
 ) -> pd.DataFrame:
     """Read and process a chunk of CSV files.  Intended for a background thread."""
     frames: list[pd.DataFrame] = []
@@ -385,6 +424,11 @@ def _read_chunk(
         frames.append(df_part)
     df = pd.concat(frames, ignore_index=True)
     del frames
+    
+    # Aggregate to hourly if not keeping 15-minute intervals
+    if not keep_15min:
+        df = aggregate_to_hourly(df)
+    
     return df
 
 
@@ -441,7 +485,7 @@ def main() -> int:
         with ThreadPoolExecutor(max_workers=1) as reader_pool:
             # Kick off reading the first chunk
             pending = reader_pool.submit(
-                _read_chunk, chunks[0], input_dir, progress
+                _read_chunk, chunks[0], input_dir, progress, args.keep_15min
             )
 
             for chunk_idx in range(len(chunks)):
@@ -451,7 +495,7 @@ def main() -> int:
                 # Submit the *next* chunk for reading while we write this one
                 if chunk_idx + 1 < len(chunks):
                     pending = reader_pool.submit(
-                        _read_chunk, chunks[chunk_idx + 1], input_dir, progress
+                        _read_chunk, chunks[chunk_idx + 1], input_dir, progress, args.keep_15min
                     )
 
                 if not printed_columns:
