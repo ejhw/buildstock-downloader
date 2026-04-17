@@ -96,6 +96,24 @@ def extract_upgrades_from_paths(paths: list[Path]) -> list[str]:
     return sorted(upgrades, key=_upgrade_sort_key)
 
 
+def find_building_type_column(df: pd.DataFrame) -> str | None:
+    """Return the building-type column name for ResStock/ComStock when present."""
+    preferred = [
+        "in.geometry_building_type_recs",
+        "in.comstock_building_type",
+    ]
+    for col in preferred:
+        if col in df.columns:
+            return col
+
+    # Fallback for future schema variants
+    for col in df.columns:
+        if "building_type" in col.lower():
+            return col
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Progress display
 # ---------------------------------------------------------------------------
@@ -196,7 +214,7 @@ def process_csv(path: Path, allowed_end_uses: set[str] | None = None) -> pd.Data
     return df_long
 
 
-def aggregate_to_hourly(df: pd.DataFrame) -> pd.DataFrame:
+def aggregate_to_hourly(df: pd.DataFrame, by_building_type: bool = False) -> pd.DataFrame:
     """
     Aggregate 15-minute interval data to hourly using hour-ending convention.
     
@@ -217,6 +235,9 @@ def aggregate_to_hourly(df: pd.DataFrame) -> pd.DataFrame:
     
     # Group by all non-numeric columns plus 'upgrade', sum other numeric columns
     group_cols = [c for c in df.columns if df[c].dtype == 'object' or c == ts_col]
+    building_type_col = find_building_type_column(df)
+    if not by_building_type and building_type_col in group_cols:
+        group_cols.remove(building_type_col)
     if 'upgrade' in df.columns and 'upgrade' not in group_cols:
         group_cols.append('upgrade')
     numeric_cols = [c for c in df.columns if str(df[c].dtype) in ['int64', 'float64', 'int32', 'float32'] and c not in group_cols]
@@ -226,6 +247,30 @@ def aggregate_to_hourly(df: pd.DataFrame) -> pd.DataFrame:
     df_agg = df.groupby(group_cols, as_index=False).agg(agg_dict)
     
     return df_agg
+
+
+def aggregate_across_building_types(df: pd.DataFrame, by_building_type: bool = False) -> pd.DataFrame:
+    """Aggregate numeric fields across building types unless explicitly retained."""
+    building_type_col = find_building_type_column(df)
+    if by_building_type or building_type_col not in df.columns:
+        return df
+
+    ts_col = next((c for c in df.columns if c.lower() == 'timestamp'), None)
+    group_cols = [
+        c for c in df.columns
+        if df[c].dtype == 'object' and c != building_type_col
+    ]
+    if ts_col and ts_col not in group_cols:
+        group_cols.append(ts_col)
+    if 'upgrade' in df.columns and 'upgrade' not in group_cols:
+        group_cols.append('upgrade')
+
+    numeric_cols = [
+        c for c in df.columns
+        if str(df[c].dtype) in ['int64', 'float64', 'int32', 'float32'] and c not in group_cols
+    ]
+    agg_dict = {col: 'sum' for col in numeric_cols}
+    return df.groupby(group_cols, as_index=False).agg(agg_dict)
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +482,11 @@ def parse_args() -> argparse.Namespace:
         metavar="END_USE",
         help="Keep only specified end uses (case-insensitive), e.g. --enduse net heating total.",
     )
+    parser.add_argument(
+        "--by_building_type",
+        action="store_true",
+        help="Retain disaggregation by building type (ResStock/ComStock) (default: aggregate across building types).",
+    )
     return parser.parse_args()
 
 
@@ -450,6 +500,7 @@ def _read_chunk(
     progress: Progress,
     keep_15min: bool = False,
     allowed_end_uses: set[str] | None = None,
+    by_building_type: bool = False,
 ) -> pd.DataFrame:
     """Read and process a chunk of CSV files.  Intended for a background thread."""
     frames: list[pd.DataFrame] = []
@@ -462,7 +513,9 @@ def _read_chunk(
     
     # Aggregate to hourly if not keeping 15-minute intervals
     if not keep_15min:
-        df = aggregate_to_hourly(df)
+        df = aggregate_to_hourly(df, by_building_type=by_building_type)
+    else:
+        df = aggregate_across_building_types(df, by_building_type=by_building_type)
     
     return df
 
@@ -565,6 +618,7 @@ def main() -> int:
                 progress,
                 args.keep_15min,
                 allowed_end_uses,
+                args.by_building_type,
             )
 
             for chunk_idx in range(len(chunks)):
@@ -580,6 +634,7 @@ def main() -> int:
                         progress,
                         args.keep_15min,
                         allowed_end_uses,
+                        args.by_building_type,
                     )
 
                 if not printed_columns:
