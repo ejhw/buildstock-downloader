@@ -558,9 +558,10 @@ def main() -> int:
             if Path(args.output).suffix.lower() == ".csv":
                 output_format = "csv"
 
-    # Build default output filename, incorporating the glob filter and upgrades
+    # Build default output filename, incorporating timeseries_aggregates,
+    # the glob filter, and upgrades.
     if output_name is None:
-        base = input_dir.name
+        base = f"{input_dir.name}_timeseries_aggregates"
         upgrades = extract_upgrades_from_paths(csv_files)
         upgrades_tag = "_".join(upgrades)
 
@@ -568,6 +569,12 @@ def main() -> int:
             # Turn e.g. "upgrade=0/state=AL/*.csv" → "upgrade=0_state=AL"
             glob_tag = args.glob.replace("/*.csv", "").replace("**/*.csv", "")
             glob_tag = glob_tag.replace("**", "").replace("/", "_").strip("_")
+
+            # Avoid duplicating the always-present "timeseries_aggregates" token.
+            if glob_tag == "timeseries_aggregates":
+                glob_tag = ""
+            elif glob_tag.startswith("timeseries_aggregates_"):
+                glob_tag = glob_tag[len("timeseries_aggregates_"):]
 
             # Replace wildcard upgrade segment with discovered upgrade IDs.
             # Example:
