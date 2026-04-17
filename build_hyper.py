@@ -32,6 +32,7 @@ Usage examples:
 import argparse
 import glob as globmod
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -77,6 +78,22 @@ def discover_csv_files(input_dir: Path, pattern: str) -> list[Path]:
     full_pattern = str(input_dir / pattern)
     files = sorted(Path(p) for p in globmod.glob(full_pattern, recursive=True))
     return files
+
+
+def extract_upgrades_from_paths(paths: list[Path]) -> list[str]:
+    """Extract unique upgrade IDs from path segments like 'upgrade=4'."""
+    upgrades: set[str] = set()
+    for path in paths:
+        for part in path.parts:
+            match = re.fullmatch(r"upgrade=(.+)", part)
+            if match:
+                upgrades.add(match.group(1))
+
+    # Sort numerically when possible, then lexicographically
+    def _upgrade_sort_key(value: str):
+        return (0, int(value)) if value.isdigit() else (1, value)
+
+    return sorted(upgrades, key=_upgrade_sort_key)
 
 
 # ---------------------------------------------------------------------------
@@ -441,21 +458,6 @@ def main() -> int:
 
     input_dir = Path(args.input_dir).expanduser().resolve()
 
-    # Build default output filename, incorporating the glob filter if specified
-    if args.output:
-        output_name = args.output
-    else:
-        base = input_dir.name
-        if args.glob != "**/*.csv":
-            # Turn e.g. "upgrade=0/state=AL/*.csv" → "upgrade=0_state=AL"
-            glob_tag = args.glob.replace("/*.csv", "").replace("**/*.csv", "")
-            glob_tag = glob_tag.replace("**", "").replace("/", "_").strip("_")
-            if glob_tag:
-                base = f"{base}_{glob_tag}"
-        output_name = f"{base}.hyper"
-
-    output_path = Path(output_name).expanduser().resolve()
-
     if not input_dir.is_dir():
         print(f"Error: input directory does not exist: {input_dir}", file=sys.stderr)
         return 1
@@ -465,6 +467,37 @@ def main() -> int:
     if not csv_files:
         print(f"No CSV files found matching '{args.glob}' under {input_dir}")
         return 1
+
+    # Build default output filename, incorporating the glob filter and upgrades
+    if args.output:
+        output_name = args.output
+    else:
+        base = input_dir.name
+        upgrades = extract_upgrades_from_paths(csv_files)
+        upgrades_tag = "_".join(upgrades)
+
+        if args.glob != "**/*.csv":
+            # Turn e.g. "upgrade=0/state=AL/*.csv" → "upgrade=0_state=AL"
+            glob_tag = args.glob.replace("/*.csv", "").replace("**/*.csv", "")
+            glob_tag = glob_tag.replace("**", "").replace("/", "_").strip("_")
+
+            # Replace wildcard upgrade segment with discovered upgrade IDs.
+            # Example:
+            #   timeseries_aggregates/upgrade=*/state=AL/*.csv
+            #   -> timeseries_aggregates_upgrade=4_8_state=AL
+            if upgrades_tag and "upgrade=*" in glob_tag:
+                glob_tag = glob_tag.replace("upgrade=*", f"upgrade={upgrades_tag}")
+            elif upgrades_tag and "upgrade=" not in glob_tag:
+                glob_tag = f"{glob_tag}_upgrade={upgrades_tag}" if glob_tag else f"upgrade={upgrades_tag}"
+
+            if glob_tag:
+                base = f"{base}_{glob_tag}"
+        elif upgrades_tag:
+            base = f"{base}_upgrade={upgrades_tag}"
+
+        output_name = f"{base}.hyper"
+
+    output_path = Path(output_name).expanduser().resolve()
 
     print(f"Found {len(csv_files):,} CSV file(s) under {input_dir}")
 
