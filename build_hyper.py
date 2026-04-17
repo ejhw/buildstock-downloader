@@ -412,8 +412,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         default=None,
-        help="Output .hyper file path "
-             "(default: <input-dir folder name>.hyper, e.g. comstock_amy2018_release_3.hyper)",
+           help="Output type or file path. Use 'hyper' or 'csv' to choose format, "
+               "or provide a custom file path like output.hyper/output.csv "
+               "(default: auto-generated .hyper filename).",
     )
     parser.add_argument(
         "--chunk-size",
@@ -490,10 +491,22 @@ def main() -> int:
         print(f"No CSV files found matching '{args.glob}' under {input_dir}")
         return 1
 
-    # Build default output filename, incorporating the glob filter and upgrades
+    # Resolve output format and output path behavior.
+    # - --output hyper|csv selects format with auto-generated filename.
+    # - --output <path> uses that exact path (format inferred by extension).
+    output_format = "hyper"
+    output_name: str | None = None
     if args.output:
-        output_name = args.output
-    else:
+        output_arg = args.output.strip().lower()
+        if output_arg in {"hyper", "csv"}:
+            output_format = output_arg
+        else:
+            output_name = args.output
+            if Path(args.output).suffix.lower() == ".csv":
+                output_format = "csv"
+
+    # Build default output filename, incorporating the glob filter and upgrades
+    if output_name is None:
         base = input_dir.name
         upgrades = extract_upgrades_from_paths(csv_files)
         upgrades_tag = "_".join(upgrades)
@@ -517,7 +530,7 @@ def main() -> int:
         elif upgrades_tag:
             base = f"{base}_upgrade={upgrades_tag}"
 
-        output_name = f"{base}.hyper"
+        output_name = f"{base}.{output_format}"
 
     output_path = Path(output_name).expanduser().resolve()
 
@@ -530,9 +543,15 @@ def main() -> int:
     progress = Progress(len(csv_files))
     printed_columns = False
 
-    # Temp directory for per-chunk .hyper files
-    tmp_dir = Path(tempfile.mkdtemp(prefix="buildstock_hyper_"))
+    # Temp directory for per-chunk .hyper files (Hyper mode only)
+    tmp_dir: Path | None = None
     chunk_paths: list[Path] = []
+    csv_rows_written = 0
+    csv_header_written = False
+    if output_format == "hyper":
+        tmp_dir = Path(tempfile.mkdtemp(prefix="buildstock_hyper_"))
+    else:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
         # Pipeline: read next chunk in a background thread while writing
@@ -568,22 +587,42 @@ def main() -> int:
                     print(f"  Columns: {list(df.columns)}")
                     printed_columns = True
 
-                # Write this chunk to its own temp .hyper file
-                chunk_hyper = tmp_dir / f"chunk_{chunk_idx + 1:04d}.hyper"
-                write_chunk_hyper(df, chunk_hyper, CreateMode.CREATE_AND_REPLACE)
-                chunk_paths.append(chunk_hyper)
+                if output_format == "hyper":
+                    # Write this chunk to its own temp .hyper file
+                    assert tmp_dir is not None
+                    chunk_hyper = tmp_dir / f"chunk_{chunk_idx + 1:04d}.hyper"
+                    write_chunk_hyper(df, chunk_hyper, CreateMode.CREATE_AND_REPLACE)
+                    chunk_paths.append(chunk_hyper)
+                else:
+                    # Append chunk to output CSV
+                    df.to_csv(
+                        output_path,
+                        mode="a" if csv_header_written else "w",
+                        index=False,
+                        header=not csv_header_written,
+                    )
+                    csv_rows_written += len(df)
+                    csv_header_written = True
+                    _progress_line(
+                        f"  Writing {output_path.name}: {csv_rows_written:,} rows"
+                    )
                 del df
 
-        # ----- merge -----
-        t_merge = time.monotonic()
-        print(f"\nMerging {len(chunk_paths)} chunk(s) into {output_path.name} …")
-        total_rows = merge_hyper_files(chunk_paths, output_path)
-        merge_elapsed = time.monotonic() - t_merge
-        print(f"  Merge complete: {total_rows:,} rows in {_fmt_time(merge_elapsed)}")
+        if output_format == "hyper":
+            # ----- merge -----
+            t_merge = time.monotonic()
+            print(f"\nMerging {len(chunk_paths)} chunk(s) into {output_path.name} …")
+            total_rows = merge_hyper_files(chunk_paths, output_path)
+            merge_elapsed = time.monotonic() - t_merge
+            print(f"  Merge complete: {total_rows:,} rows in {_fmt_time(merge_elapsed)}")
+        else:
+            print()
+            print(f"  CSV complete: {csv_rows_written:,} rows")
 
     finally:
-        # Clean up temp chunk files
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        # Clean up temp chunk files (Hyper mode only)
+        if tmp_dir is not None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     elapsed = time.monotonic() - t0
     print(f"\nDone in {_fmt_time(elapsed)}  →  {output_path}")
