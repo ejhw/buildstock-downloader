@@ -114,6 +114,27 @@ def find_building_type_column(df: pd.DataFrame) -> str | None:
     return None
 
 
+def build_agg_dict(
+    df: pd.DataFrame,
+    group_cols: list[str],
+    for_timestamp_aggregation: bool,
+) -> dict[str, str]:
+    """Build aggregation rules based on explicit column-name conventions."""
+    agg: dict[str, str] = {}
+    special_cols = {"models_used", "units_represented", "floor_area_represented"}
+
+    for col in df.columns:
+        if col in group_cols:
+            continue
+
+        if "kwh" in col.lower():
+            agg[col] = "sum"
+        elif col in special_cols:
+            agg[col] = "mean" if for_timestamp_aggregation else "sum"
+
+    return agg
+
+
 # ---------------------------------------------------------------------------
 # Progress display
 # ---------------------------------------------------------------------------
@@ -232,21 +253,20 @@ def aggregate_to_hourly(df: pd.DataFrame, by_building_type: bool = False) -> pd.
     
     # Ceil to the next hour (hour-ending convention)
     df[ts_col] = df[ts_col].dt.ceil('h')
-    
-    # Group by all non-numeric columns plus 'upgrade', sum other numeric columns
+
+    # Stage 1: aggregate timestamps (hour-ending). For models/units/floor area we average.
     group_cols = [c for c in df.columns if df[c].dtype == 'object' or c == ts_col]
-    building_type_col = find_building_type_column(df)
-    if not by_building_type and building_type_col in group_cols:
-        group_cols.remove(building_type_col)
     if 'upgrade' in df.columns and 'upgrade' not in group_cols:
         group_cols.append('upgrade')
-    numeric_cols = [c for c in df.columns if str(df[c].dtype) in ['int64', 'float64', 'int32', 'float32'] and c not in group_cols]
-    
-    # Use groupby with agg to preserve structure
-    agg_dict = {col: 'sum' for col in numeric_cols}
-    df_agg = df.groupby(group_cols, as_index=False).agg(agg_dict)
-    
-    return df_agg
+    agg_dict = build_agg_dict(df, group_cols, for_timestamp_aggregation=True)
+    if agg_dict:
+        df = df.groupby(group_cols, as_index=False).agg(agg_dict)
+
+    # Stage 2: optionally aggregate across building types. For models/units we sum.
+    if not by_building_type:
+        df = aggregate_across_building_types(df, by_building_type=False)
+
+    return df
 
 
 def aggregate_across_building_types(df: pd.DataFrame, by_building_type: bool = False) -> pd.DataFrame:
@@ -265,11 +285,35 @@ def aggregate_across_building_types(df: pd.DataFrame, by_building_type: bool = F
     if 'upgrade' in df.columns and 'upgrade' not in group_cols:
         group_cols.append('upgrade')
 
-    numeric_cols = [
-        c for c in df.columns
-        if str(df[c].dtype) in ['int64', 'float64', 'int32', 'float32'] and c not in group_cols
-    ]
-    agg_dict = {col: 'sum' for col in numeric_cols}
+    agg_dict = build_agg_dict(df, group_cols, for_timestamp_aggregation=False)
+    if not agg_dict:
+        return df
+    return df.groupby(group_cols, as_index=False).agg(agg_dict)
+
+
+def reconcile_chunk_aggregates(df: pd.DataFrame, by_building_type: bool = False) -> pd.DataFrame:
+    """
+    Re-aggregate already-aggregated chunk outputs across chunk boundaries.
+
+    Chunk-level processing can split a logical group (e.g., one state+upgrade)
+    across chunks. This pass merges those partial aggregates back together.
+    """
+    ts_col = next((c for c in df.columns if c.lower() == "timestamp"), None)
+    building_type_col = find_building_type_column(df)
+
+    group_cols = [c for c in df.columns if df[c].dtype == "object"]
+    if ts_col and ts_col not in group_cols:
+        group_cols.append(ts_col)
+    if "upgrade" in df.columns and "upgrade" not in group_cols:
+        group_cols.append("upgrade")
+
+    if not by_building_type and building_type_col in group_cols:
+        group_cols.remove(building_type_col)
+
+    agg_dict = build_agg_dict(df, group_cols, for_timestamp_aggregation=False)
+    if not agg_dict:
+        return df.drop_duplicates(subset=group_cols)
+
     return df.groupby(group_cols, as_index=False).agg(agg_dict)
 
 
@@ -603,88 +647,70 @@ def main() -> int:
     progress = Progress(len(csv_files))
     printed_columns = False
 
-    # Temp directory for per-chunk .hyper files (Hyper mode only)
-    tmp_dir: Path | None = None
-    chunk_paths: list[Path] = []
-    csv_rows_written = 0
-    csv_header_written = False
+    # Accumulate chunk-level aggregates, then reconcile across chunk boundaries.
+    combined_df: pd.DataFrame | None = None
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Pipeline: read next chunk in a background thread while writing
+    # the current chunk to Hyper.
+    with ThreadPoolExecutor(max_workers=1) as reader_pool:
+        # Kick off reading the first chunk
+        pending = reader_pool.submit(
+            _read_chunk,
+            chunks[0],
+            input_dir,
+            progress,
+            args.keep_15min,
+            allowed_end_uses,
+            args.by_building_type,
+        )
+
+        for chunk_idx in range(len(chunks)):
+            # Wait for the current chunk to finish reading
+            df = pending.result()
+
+            # Submit the *next* chunk for reading while we write this one
+            if chunk_idx + 1 < len(chunks):
+                pending = reader_pool.submit(
+                    _read_chunk,
+                    chunks[chunk_idx + 1],
+                    input_dir,
+                    progress,
+                    args.keep_15min,
+                    allowed_end_uses,
+                    args.by_building_type,
+                )
+
+            if not printed_columns:
+                progress.finish()
+                print(f"  Columns: {list(df.columns)}")
+                printed_columns = True
+
+            if combined_df is None:
+                combined_df = df
+            else:
+                combined_df = pd.concat([combined_df, df], ignore_index=True)
+                combined_df = reconcile_chunk_aggregates(
+                    combined_df,
+                    by_building_type=args.by_building_type,
+                )
+            del df
+
+    if combined_df is None:
+        print("Error: no data produced after processing CSV files.", file=sys.stderr)
+        return 1
+
+    # Final reconciliation pass for safety (also handles single-chunk runs).
+    combined_df = reconcile_chunk_aggregates(
+        combined_df,
+        by_building_type=args.by_building_type,
+    )
+
     if output_format == "hyper":
-        tmp_dir = Path(tempfile.mkdtemp(prefix="buildstock_hyper_"))
+        write_chunk_hyper(combined_df, output_path, CreateMode.CREATE_AND_REPLACE)
     else:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        # Pipeline: read next chunk in a background thread while writing
-        # the current chunk to Hyper.
-        with ThreadPoolExecutor(max_workers=1) as reader_pool:
-            # Kick off reading the first chunk
-            pending = reader_pool.submit(
-                _read_chunk,
-                chunks[0],
-                input_dir,
-                progress,
-                args.keep_15min,
-                allowed_end_uses,
-                args.by_building_type,
-            )
-
-            for chunk_idx in range(len(chunks)):
-                # Wait for the current chunk to finish reading
-                df = pending.result()
-
-                # Submit the *next* chunk for reading while we write this one
-                if chunk_idx + 1 < len(chunks):
-                    pending = reader_pool.submit(
-                        _read_chunk,
-                        chunks[chunk_idx + 1],
-                        input_dir,
-                        progress,
-                        args.keep_15min,
-                        allowed_end_uses,
-                        args.by_building_type,
-                    )
-
-                if not printed_columns:
-                    progress.finish()
-                    print(f"  Columns: {list(df.columns)}")
-                    printed_columns = True
-
-                if output_format == "hyper":
-                    # Write this chunk to its own temp .hyper file
-                    assert tmp_dir is not None
-                    chunk_hyper = tmp_dir / f"chunk_{chunk_idx + 1:04d}.hyper"
-                    write_chunk_hyper(df, chunk_hyper, CreateMode.CREATE_AND_REPLACE)
-                    chunk_paths.append(chunk_hyper)
-                else:
-                    # Append chunk to output CSV
-                    df.to_csv(
-                        output_path,
-                        mode="a" if csv_header_written else "w",
-                        index=False,
-                        header=not csv_header_written,
-                    )
-                    csv_rows_written += len(df)
-                    csv_header_written = True
-                    _progress_line(
-                        f"  Writing {output_path.name}: {csv_rows_written:,} rows"
-                    )
-                del df
-
-        if output_format == "hyper":
-            # ----- merge -----
-            t_merge = time.monotonic()
-            print(f"\nMerging {len(chunk_paths)} chunk(s) into {output_path.name} …")
-            total_rows = merge_hyper_files(chunk_paths, output_path)
-            merge_elapsed = time.monotonic() - t_merge
-            print(f"  Merge complete: {total_rows:,} rows in {_fmt_time(merge_elapsed)}")
-        else:
-            print()
-            print(f"  CSV complete: {csv_rows_written:,} rows")
-
-    finally:
-        # Clean up temp chunk files (Hyper mode only)
-        if tmp_dir is not None:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+        combined_df.to_csv(output_path, index=False)
+        print(f"  CSV complete: {len(combined_df):,} rows")
 
     elapsed = time.monotonic() - t0
     print(f"\nDone in {_fmt_time(elapsed)}  →  {output_path}")
