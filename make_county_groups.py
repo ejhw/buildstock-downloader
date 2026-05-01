@@ -8,12 +8,14 @@ The script:
 3. Adds county_name.
 4. Adds one dummy row for each county_fips5 missing from the county reference,
    using a dominant 2010 PUMA lookup when available.
-5. Writes a CSV with quoted fields so FIPS-like strings stay intact.
+5. Writes a full CSV with quoted fields so FIPS-like strings stay intact.
+6. Writes a second CSV with one row per county-to-county_group mapping.
 
 Usage:
     python make_county_groups.py
     python make_county_groups.py --parquet /path/to/upgrade0.parquet
     python make_county_groups.py --output upgrade0_county_groups_with_fips.csv
+    python make_county_groups.py --mapping-output county_group_mapping.csv
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ DEFAULT_PARQUET = Path(
     "resstock_amy2018_release_1 annual/upgrade0.parquet"
 )
 DEFAULT_OUTPUT = Path("upgrade0_county_groups_with_fips.csv")
+DEFAULT_MAPPING_OUTPUT = Path("county_group_mapping.csv")
 COUNTY_REF_URL = "https://www2.census.gov/geo/docs/reference/codes2020/national_county2020.txt"
 TRACT_PUMA_2010_URL = "https://www2.census.gov/geo/docs/maps-data/data/rel/2010_Census_Tract_to_2010_PUMA.txt"
 
@@ -100,6 +103,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_OUTPUT,
         help=f"Output CSV path (default: {DEFAULT_OUTPUT})",
+    )
+    parser.add_argument(
+        "--mapping-output",
+        type=Path,
+        default=DEFAULT_MAPPING_OUTPUT,
+        help=f"County-to-county_group mapping CSV path (default: {DEFAULT_MAPPING_OUTPUT})",
     )
     return parser.parse_args()
 
@@ -312,19 +321,30 @@ def build_output_dataframe(parquet_path: Path) -> pd.DataFrame:
     ]
 
 
+def build_mapping_dataframe(output_df: pd.DataFrame) -> pd.DataFrame:
+    mapping_df = output_df[
+        ["state", "county", "county_name", "county_fips5", "county_groups"]
+    ].drop_duplicates()
+    return mapping_df.sort_values(["state", "county_fips5", "county_groups"]).reset_index(drop=True)
+
+
 def main() -> int:
     args = parse_args()
     parquet_path = args.parquet.expanduser().resolve()
     output_path = args.output.expanduser().resolve()
+    mapping_output_path = args.mapping_output.expanduser().resolve()
 
     if not parquet_path.exists():
         print(f"Error: parquet file does not exist: {parquet_path}")
         return 1
 
     output_df = build_output_dataframe(parquet_path)
+    mapping_df = build_mapping_dataframe(output_df)
     output_df.to_csv(output_path, index=False, quoting=csv.QUOTE_ALL)
+    mapping_df.to_csv(mapping_output_path, index=False, quoting=csv.QUOTE_ALL)
 
     print(f"Wrote {len(output_df):,} rows to {output_path}")
+    print(f"Wrote {len(mapping_df):,} county mappings to {mapping_output_path}")
     return 0
 
 
