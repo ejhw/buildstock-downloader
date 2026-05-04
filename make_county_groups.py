@@ -6,16 +6,19 @@ The script:
 1. Reads the parquet and keeps the county/state/PUMA/weight fields.
 2. Derives county_fips5 and county_groups.
 3. Adds county_name.
-4. Adds one dummy row for each county_fips5 missing from the county reference,
+4. Joins ReEDS county-to-zone mapping (county_fips5 -> R).
+5. Splits county_groups so each county_group has only one R value.
+6. Adds one dummy row for each county_fips5 missing from the county reference,
    using a dominant 2010 PUMA lookup when available.
-5. Writes a full CSV with quoted fields so FIPS-like strings stay intact.
-6. Writes a second CSV with one row per county-to-county_group mapping.
+7. Writes a full CSV with quoted fields so FIPS-like strings stay intact.
+8. Writes a second CSV with one row per county-to-county_group mapping.
 
 Usage:
     python make_county_groups.py
     python make_county_groups.py --parquet /path/to/upgrade0.parquet
     python make_county_groups.py --output upgrade0_county_groups_with_fips.csv
     python make_county_groups.py --mapping-output county_group_mapping.csv
+    python make_county_groups.py --reeds-file reeds_county2zone_54.csv
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ DEFAULT_PARQUET = Path(
 )
 DEFAULT_OUTPUT = Path("upgrade0_county_groups_with_fips.csv")
 DEFAULT_MAPPING_OUTPUT = Path("county_group_mapping.csv")
+DEFAULT_REEDS_FILE = Path("reeds_county2zone_54.csv")
 COUNTY_REF_URL = "https://www2.census.gov/geo/docs/reference/codes2020/national_county2020.txt"
 TRACT_PUMA_2010_URL = "https://www2.census.gov/geo/docs/maps-data/data/rel/2010_Census_Tract_to_2010_PUMA.txt"
 
@@ -109,6 +113,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_MAPPING_OUTPUT,
         help=f"County-to-county_group mapping CSV path (default: {DEFAULT_MAPPING_OUTPUT})",
+    )
+    parser.add_argument(
+        "--reeds-file",
+        type=Path,
+        default=DEFAULT_REEDS_FILE,
+        help=f"ReEDS county-to-zone CSV path (default: {DEFAULT_REEDS_FILE})",
     )
     return parser.parse_args()
 
@@ -282,6 +292,7 @@ def add_missing_counties(selected_df: pd.DataFrame, county_ref: pd.DataFrame) ->
         "county_fips5",
         "county_groups",
         "county_name",
+        "R",
     ]
     selected_df = selected_df[output_columns].copy()
 
@@ -302,6 +313,7 @@ def add_missing_counties(selected_df: pd.DataFrame, county_ref: pd.DataFrame) ->
                 "county_fips5": county_fips5,
                 "county_groups": county_group,
                 "county_name": row["COUNTYNAME"],
+                "R": pd.NA,
             }
         )
 
@@ -315,17 +327,82 @@ def build_output_dataframe(parquet_path: Path) -> pd.DataFrame:
     selected_df = assign_county_groups(selected_df)
     county_ref = load_county_reference()
     selected_df = add_county_name(selected_df, county_ref)
+    selected_df["R"] = pd.NA
     selected_df = add_missing_counties(selected_df, county_ref)
     return selected_df[
-        ["bldgid", "county", "state", "puma", "weight", "county_fips5", "county_groups", "county_name"]
+        ["bldgid", "county", "state", "puma", "weight", "county_fips5", "county_groups", "county_name", "R"]
     ]
+
+
+def add_reeds_zone(output_df: pd.DataFrame, reeds_file: Path) -> pd.DataFrame:
+    reeds_df = pd.read_csv(reeds_file, dtype=str)
+    if "FIPS" not in reeds_df.columns:
+        raise KeyError("ReEDS file is missing required column: FIPS")
+    r_col = "R" if "R" in reeds_df.columns else "r"
+    if r_col not in reeds_df.columns:
+        raise KeyError("ReEDS file is missing required zone column: R or r")
+
+    reeds_df = reeds_df[["FIPS", r_col]].copy()
+    reeds_df["FIPS"] = reeds_df["FIPS"].astype(str).str.zfill(5)
+    reeds_df = reeds_df.rename(columns={"FIPS": "county_fips5", r_col: "R"})
+
+    output_df = output_df.copy()
+    output_df["county_fips5"] = output_df["county_fips5"].astype(str).str.zfill(5)
+    output_df = output_df.drop(columns=["R"], errors="ignore").merge(
+        reeds_df,
+        on="county_fips5",
+        how="left",
+    )
+    return output_df
+
+
+def split_groups_by_reeds_zone(output_df: pd.DataFrame) -> pd.DataFrame:
+    output_df = output_df.copy()
+    county_level = output_df[
+        ["county", "county_fips5", "county_groups", "R"]
+    ].drop_duplicates()
+    county_level["R_key"] = county_level["R"].fillna("__MISSING__")
+
+    id_series = county_level["county_groups"].astype(str).str.extract(r"^county_group_(\d+)$")[0]
+    max_existing_id = int(id_series.dropna().astype(int).max()) if id_series.notna().any() else -1
+    next_group_id = max_existing_id + 1
+
+    county_to_new_group: dict[str, str] = {}
+    for group_name, group_df in county_level.groupby("county_groups", dropna=False):
+        if not isinstance(group_name, str) or not group_name.startswith("county_group_"):
+            continue
+
+        r_counts = (
+            group_df.groupby("R_key", as_index=False)["county"]
+            .nunique()
+            .rename(columns={"county": "num_counties"})
+            .sort_values(["num_counties", "R_key"], ascending=[False, True])
+        )
+        if len(r_counts) <= 1:
+            continue
+
+        primary_r = r_counts.iloc[0]["R_key"]
+        for r_key in r_counts["R_key"].tolist():
+            if r_key == primary_r:
+                continue
+            replacement_group = f"county_group_{next_group_id}"
+            next_group_id += 1
+            affected_counties = group_df.loc[group_df["R_key"] == r_key, "county"].tolist()
+            for county in affected_counties:
+                county_to_new_group[county] = replacement_group
+
+    if county_to_new_group:
+        mask = output_df["county"].isin(county_to_new_group)
+        output_df.loc[mask, "county_groups"] = output_df.loc[mask, "county"].map(county_to_new_group)
+
+    return output_df
 
 
 def build_mapping_dataframe(output_df: pd.DataFrame) -> pd.DataFrame:
     mapping_df = output_df[
-        ["state", "county", "county_name", "county_fips5", "county_groups"]
+        ["state", "county", "county_name", "county_fips5", "R", "county_groups"]
     ].drop_duplicates()
-    return mapping_df.sort_values(["state", "county_fips5", "county_groups"]).reset_index(drop=True)
+    return mapping_df.sort_values(["state", "county_fips5", "R", "county_groups"]).reset_index(drop=True)
 
 
 def main() -> int:
@@ -333,12 +410,18 @@ def main() -> int:
     parquet_path = args.parquet.expanduser().resolve()
     output_path = args.output.expanduser().resolve()
     mapping_output_path = args.mapping_output.expanduser().resolve()
+    reeds_file = args.reeds_file.expanduser().resolve()
 
     if not parquet_path.exists():
         print(f"Error: parquet file does not exist: {parquet_path}")
         return 1
+    if not reeds_file.exists():
+        print(f"Error: ReEDS file does not exist: {reeds_file}")
+        return 1
 
     output_df = build_output_dataframe(parquet_path)
+    output_df = add_reeds_zone(output_df, reeds_file)
+    output_df = split_groups_by_reeds_zone(output_df)
     mapping_df = build_mapping_dataframe(output_df)
     output_df.to_csv(output_path, index=False, quoting=csv.QUOTE_ALL)
     mapping_df.to_csv(mapping_output_path, index=False, quoting=csv.QUOTE_ALL)
