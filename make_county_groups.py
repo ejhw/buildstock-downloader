@@ -363,11 +363,18 @@ def split_groups_by_reeds_zone(output_df: pd.DataFrame) -> pd.DataFrame:
     ].drop_duplicates()
     county_level["R_key"] = county_level["R"].fillna("__MISSING__")
 
+    # Find all numeric IDs that have ever been used (including those that might be created by splits)
+    all_group_ids = set()
     id_series = county_level["county_groups"].astype(str).str.extract(r"^county_group_(\d+)$")[0]
-    max_existing_id = int(id_series.dropna().astype(int).max()) if id_series.notna().any() else -1
+    existing_ids = set(pd.to_numeric(id_series.dropna(), errors='coerce').astype(int).unique())
+    all_group_ids.update(existing_ids)
+    
+    # Start next_group_id from max existing + 1
+    max_existing_id = max(existing_ids) if existing_ids else -1
     next_group_id = max_existing_id + 1
 
     county_to_new_group: dict[str, str] = {}
+    
     for group_name, group_df in county_level.groupby("county_groups", dropna=False):
         if not isinstance(group_name, str) or not group_name.startswith("county_group_"):
             continue
@@ -385,7 +392,11 @@ def split_groups_by_reeds_zone(output_df: pd.DataFrame) -> pd.DataFrame:
         for r_key in r_counts["R_key"].tolist():
             if r_key == primary_r:
                 continue
+            # Ensure we don't create an ID that's already been used or is in all_group_ids
+            while next_group_id in all_group_ids:
+                next_group_id += 1
             replacement_group = f"county_group_{next_group_id}"
+            all_group_ids.add(next_group_id)
             next_group_id += 1
             affected_counties = group_df.loc[group_df["R_key"] == r_key, "county"].tolist()
             for county in affected_counties:
@@ -405,6 +416,65 @@ def build_mapping_dataframe(output_df: pd.DataFrame) -> pd.DataFrame:
     return mapping_df.sort_values(["state", "county_fips5", "R", "county_groups"]).reset_index(drop=True)
 
 
+def merge_county_groups(output_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply manual merges of county groups to address low sample counts.
+    Each merge consolidates multiple group IDs into a single target group.
+    
+    NOTE: This function does NOT merge groups if they have different ReEDS zones (R values),
+    as this would violate the constraint that each county_group should have only one R value.
+    """
+    output_df = output_df.copy()
+    
+    # Define merge mapping: source_group -> target_group
+    merge_specs = [
+        ("county_group_624", "county_group_551"),
+        ("county_group_626", "county_group_619"),
+        ("county_group_628", "county_group_619"),
+        ("county_group_615", "county_group_349"),
+        ("county_group_625", "county_group_194"),  # TX: 625+194 (625->193 blocked by zone mismatch)
+        ("county_group_616", "county_group_618"),
+        ("county_group_614", "county_group_121"),
+        ("independent_county_G0800390", "county_group_45"),
+        ("independent_county_G2001730", "independent_county_G2000790"),
+        ("independent_county_G1700990", "county_group_621"),
+        ("county_group_413", "county_group_382"),
+        ("independent_county_G2300230", "county_group_186"),    # Maine
+        ("independent_county_G0601070", "county_group_620"),    # CA
+        ("county_group_627", "county_group_131"), # 627 -> 131
+        ("county_group_16", "county_group_619"), # 619 -> 16
+    ]
+    
+    # Get unique R values for each group
+    group_r_values = {}
+    county_level = output_df[["county_groups", "R"]].drop_duplicates()
+    for group_name in output_df["county_groups"].unique():
+        r_vals = county_level[county_level["county_groups"] == group_name]["R"].unique()
+        # Get the non-null R value if it exists
+        r_vals_nonnull = [v for v in r_vals if pd.notna(v)]
+        group_r_values[group_name] = r_vals_nonnull[0] if r_vals_nonnull else None
+    
+    # Apply merges, but skip those that would violate zone constraints
+    merge_map = {}
+    for source, target in merge_specs:
+        source_r = group_r_values.get(source)
+        target_r = group_r_values.get(target)
+        
+        # Only allow merge if both have the same R value (or both are None/NA)
+        if source_r == target_r:
+            merge_map[source] = target
+        else:
+            print(f"WARNING: Skipping merge {source} -> {target} due to zone mismatch:")
+            print(f"  {source} has R={source_r}, {target} has R={target_r}")
+    
+    # Apply the merge mapping
+    output_df["county_groups"] = output_df["county_groups"].map(
+        lambda x: merge_map.get(x, x)
+    )
+    
+    return output_df
+
+
 def main() -> int:
     args = parse_args()
     parquet_path = args.parquet.expanduser().resolve()
@@ -422,6 +492,7 @@ def main() -> int:
     output_df = build_output_dataframe(parquet_path)
     output_df = add_reeds_zone(output_df, reeds_file)
     output_df = split_groups_by_reeds_zone(output_df)
+    output_df = merge_county_groups(output_df)
     mapping_df = build_mapping_dataframe(output_df)
     output_df.to_csv(output_path, index=False, quoting=csv.QUOTE_ALL)
     mapping_df.to_csv(mapping_output_path, index=False, quoting=csv.QUOTE_ALL)
