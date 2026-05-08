@@ -398,8 +398,9 @@ def parse_args() -> argparse.Namespace:
         "--aggregation",
         choices=AGGREGATION_CHOICES,
         default=None,
-        help="Aggregation level for annual results. Required when "
-             "--dataset-type=annual. Choices: "
+           help="Aggregation level for annual results. Required for annual "
+               "ComStock datasets; optional for annual ResStock datasets "
+               "(defaults to national). Choices: "
              + ", ".join(AGGREGATION_CHOICES) + ".",
     )
     parser.add_argument(
@@ -433,7 +434,13 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
 
     if args.dataset_type == "annual" and args.aggregation is None:
-        parser.error("--aggregation is required when --dataset-type=annual")
+        if "resstock" in args.release_name.lower():
+            args.aggregation = "national"
+        else:
+            parser.error(
+                "--aggregation is required when --dataset-type=annual "
+                "for non-ResStock releases"
+            )
     if args.aggregation is not None and args.dataset_type != "annual":
         parser.error("--aggregation is only used with --dataset-type=annual")
     if args.annual_version != "full" and args.dataset_type != "annual":
@@ -513,11 +520,19 @@ def main() -> int:
         fmt_dir = "csv" if args.annual_csv else "parquet"
         if states_filter:
             versions = [annual_version] if annual_version else ["basic", "full"]
-            listing_prefixes = [
-                f"{prefix}{ver}/{fmt_dir}/state={st}/"
-                for ver in versions
-                for st in sorted(states_filter)
-            ]
+            if "resstock" in args.release_name:
+                # Some ResStock annual layouts encode state in filename rather
+                # than in a state=XX partition directory.
+                listing_prefixes = [
+                    f"{prefix}{ver}/{fmt_dir}/"
+                    for ver in versions
+                ]
+            else:
+                listing_prefixes = [
+                    f"{prefix}{ver}/{fmt_dir}/state={st}/"
+                    for ver in versions
+                    for st in sorted(states_filter)
+                ]
         elif annual_version:
             listing_prefixes = [f"{prefix}{annual_version}/{fmt_dir}/"]
     elif args.gap_model:
@@ -587,8 +602,8 @@ def main() -> int:
             else:
                 # Annual files: upgrade number is in the filename, e.g.
                 # AL_upgrade0_agg.parquet, AL_upgrade10_agg_basic.csv.gz,
-                # or AK_upgrade0.parquet (ResStock, no _agg suffix)
-                m = re.search(r'_upgrade(\d+)', parts[-1])
+                # AK_upgrade0.parquet, or upgrade0.parquet (ResStock national)
+                m = re.search(r'(?:^|_)upgrade(\d+)(?:_|\.|$)', parts[-1])
                 if m:
                     if m.group(1) not in upgrades_filter:
                         return False
